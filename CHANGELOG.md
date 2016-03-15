@@ -68,6 +68,14 @@ And now checkout the connection in the `setup` block of every test case that nee
 
 The previous sandbox API, which used `begin_test_transaction` and `restart_test_transaction`, is no longer supported.
 
+## Note for tests of channels in Phoenix
+
+Currently there is no automatic way of doing this, but please be advised to add:
+
+    Ecto.Adapters.SQL.Sandbox.mode(TestRepo, {:shared, self()})
+
+Right after the checkout, otherwise you might be reported with problems of finding the ownership process.
+
 ### Insert all
 
 Ecto now allows developers to insert multiple entries at once via `Ecto.Repo.insert_all/3`:
