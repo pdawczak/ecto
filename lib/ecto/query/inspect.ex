@@ -1,8 +1,22 @@
-defimpl Inspect, for: Ecto.Query do
-  import Inspect.Algebra
-  import Kernel, except: [to_string: 1]
-  alias Ecto.Query.JoinExpr
+import Inspect.Algebra
+import Kernel, except: [to_string: 1]
 
+alias Ecto.Query.{DynamicExpr, JoinExpr}
+
+defimpl Inspect, for: Ecto.Query.DynamicExpr do
+  def inspect(%DynamicExpr{binding: binding} = dynamic, opts) do
+    {expr, params, _, _} =
+      Ecto.Query.Builder.Dynamic.fully_expand(%Ecto.Query{joins: Enum.drop(binding, 1)}, dynamic)
+    names =
+      for {name, _, _} <- binding, do: Atom.to_string(name)
+    inspected =
+      Inspect.Ecto.Query.expr(expr, List.to_tuple(names), %{expr: expr, params: params})
+
+    surround_many("dynamic(", [Macro.to_string(binding), inspected], ")", opts, fn str, _ -> str end)
+  end
+end
+
+defimpl Inspect, for: Ecto.Query do
   @doc false
   def inspect(query, opts) do
     list = Enum.map(to_list(query), fn
@@ -38,9 +52,9 @@ defimpl Inspect, for: Ecto.Query do
     preloads  = preloads(query.preloads)
     assocs    = assocs(query.assocs, names)
 
-    wheres    = kw_exprs(:where, query.wheres, names)
+    wheres    = bool_exprs(%{and: :where, or: :or_where}, query.wheres, names)
     group_bys = kw_exprs(:group_by, query.group_bys, names)
-    havings   = kw_exprs(:having, query.havings, names)
+    havings   = bool_exprs(%{and: :having, or: :or_having}, query.havings, names)
     order_bys = kw_exprs(:order_by, query.order_bys, names)
     updates   = kw_exprs(:update, query.updates, names)
 
@@ -58,12 +72,15 @@ defimpl Inspect, for: Ecto.Query do
 
   defp unbound_from(nil),           do: "query"
   defp unbound_from({source, nil}), do: inspect source
-  defp unbound_from({nil, model}),  do: inspect model
-  defp unbound_from(from = {source, model}) do
-    inspect if(source == model.__schema__(:source), do: model, else: from)
+  defp unbound_from({nil, schema}),  do: inspect schema
+  defp unbound_from(from = {source, schema}) do
+    inspect if source == schema.__schema__(:source), do: schema, else: from
   end
   defp unbound_from(%Ecto.SubQuery{query: query}) do
     "subquery(#{to_string query})"
+  end
+  defp unbound_from(%Ecto.Query{} = query) do
+    "^" <> inspect(query)
   end
 
   defp joins(joins, names) do
@@ -102,6 +119,12 @@ defimpl Inspect, for: Ecto.Query do
     end
   end
 
+  defp bool_exprs(keys, exprs, names) do
+    Enum.map exprs, fn %{expr: expr, op: op} = part ->
+      {Map.fetch!(keys, op), expr(expr, names, part)}
+    end
+  end
+
   defp kw_exprs(key, exprs, names) do
     Enum.map exprs, &{key, expr(&1, names)}
   end
@@ -116,7 +139,8 @@ defimpl Inspect, for: Ecto.Query do
     expr(expr, names, part)
   end
 
-  defp expr(expr, names, part) do
+  @doc false
+  def expr(expr, names, part) do
     Macro.to_string(expr, &expr_to_string(&1, &2, names, part))
   end
 
@@ -128,8 +152,12 @@ defimpl Inspect, for: Ecto.Query do
   # Convert variables to proper names
   defp expr_to_string({:&, _, [ix]}, _, names, %{take: take}) do
     case take do
-      %{^ix => fields} -> "take(" <> elem(names, ix) <> ", " <> Kernel.inspect(fields) <> ")"
-      _ -> elem(names, ix)
+      %{^ix => {:any, fields}} when ix == 0 ->
+        Kernel.inspect(fields)
+      %{^ix => {tag, fields}} ->
+        "#{tag}(" <> elem(names, ix) <> ", " <> Kernel.inspect(fields) <> ")"
+      _ ->
+        elem(names, ix)
     end
   end
 
@@ -146,12 +174,10 @@ defimpl Inspect, for: Ecto.Query do
   end
 
   defp expr_to_string({:^, _, [ix]}, _, _, %{params: params}) do
-    escaped =
-      case Enum.at(params || [], ix) do
-        {value, _type} -> Macro.escape(value)
-        _              -> {:..., [], nil}
-      end
-    Macro.to_string {:^, [], [escaped]}
+    case Enum.at(params || [], ix) do
+      {value, _type} -> "^" <> Kernel.inspect(value, charlists: :as_lists)
+      _              -> "^..."
+    end
   end
 
   # Strip trailing ()
@@ -181,17 +207,20 @@ defimpl Inspect, for: Ecto.Query do
     Enum.join [inspect(frag <> s)|Enum.reverse(args)], ", "
   end
 
-  defp join_qual(:inner), do: :join
-  defp join_qual(:left),  do: :left_join
-  defp join_qual(:right), do: :right_join
-  defp join_qual(:full),  do: :full_join
+  defp join_qual(:inner),         do: :join
+  defp join_qual(:inner_lateral), do: :join_lateral
+  defp join_qual(:left),          do: :left_join
+  defp join_qual(:left_lateral),  do: :left_join_lateral
+  defp join_qual(:right),         do: :right_join
+  defp join_qual(:full),          do: :full_join
+  defp join_qual(:cross),         do: :cross_join
 
   defp collect_sources(query) do
     [from_sources(query.from) | join_sources(query.joins)]
   end
 
   defp from_sources(%Ecto.SubQuery{query: query}), do: from_sources(query.from)
-  defp from_sources({source, model}), do: model || source
+  defp from_sources({source, schema}), do: schema || source
   defp from_sources(nil), do: "query"
 
   defp join_sources(joins) do
@@ -200,6 +229,8 @@ defimpl Inspect, for: Ecto.Query do
         assoc
       %JoinExpr{source: {:fragment, _, _}} ->
         "fragment"
+      %JoinExpr{source: %Ecto.Query{from: from}} ->
+        from_sources(from)
       %JoinExpr{source: source} ->
         from_sources(source)
     end)

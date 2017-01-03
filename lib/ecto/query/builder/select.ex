@@ -1,3 +1,5 @@
+import Kernel, except: [apply: 2]
+
 defmodule Ecto.Query.Builder.Select do
   @moduledoc false
 
@@ -22,14 +24,9 @@ defmodule Ecto.Query.Builder.Select do
 
   """
   @spec escape(Macro.t, Keyword.t, Macro.Env.t) :: {Macro.t, {%{}, %{}}}
-  def escape({:^, _, [interpolated]}, _vars, _env) do
-    fields = quote(do: Ecto.Query.Builder.Select.fields!(unquote(interpolated)))
-    {{:{}, [], [:&, [], [0]]}, {%{}, %{0 => fields}}}
-  end
-
   def escape(other, vars, env) do
     if take?(other) do
-      {{:{}, [], [:&, [], [0]]}, {%{}, %{0 => other}}}
+      {{:{}, [], [:&, [], [0]]}, {%{}, %{0 => {:any, other}}}}
     else
       escape(other, {%{}, %{}}, vars, env)
     end
@@ -48,15 +45,15 @@ defmodule Ecto.Query.Builder.Select do
   end
 
   # Map
-  defp escape({:%{}, _, pairs}, params_take, vars, env) do
-    {pairs, params_take} = Enum.map_reduce pairs, params_take, fn({k, v}, acc) ->
-      {k, acc} = escape_key(k, acc, vars, env)
-      {v, acc} = escape(v, acc, vars, env)
-      {{k, v}, acc}
-    end
+  defp escape({:%{}, _, [{:|, _, [data, pairs]}]}, params_take, vars, env) do
+    {data, params_take} = escape(data, params_take, vars, env)
+    {pairs, params_take} = escape_pairs(pairs, params_take, vars, env)
+    {{:{}, [], [:%{}, [], [{:{}, [], [:|, [], [data, pairs]]}]]}, params_take}
+  end
 
-    expr = {:{}, [], [:%{}, [], pairs]}
-    {expr, params_take}
+  defp escape({:%{}, _, pairs}, params_take, vars, env) do
+    {pairs, params_take} = escape_pairs(pairs, params_take, vars, env)
+    {{:{}, [], [:%{}, [], pairs]}, params_take}
   end
 
   # List
@@ -64,22 +61,12 @@ defmodule Ecto.Query.Builder.Select do
     Enum.map_reduce(list, params_take, &escape(&1, &2, vars, env))
   end
 
-  # take(var, [:foo, :bar])
-  defp escape({:take, _, [{var, _, context}, fields]}, {params, take}, vars, _env)
-      when is_atom(var) and is_atom(context) do
-    taken =
-      case fields do
-        {:^, _, [interpolated]} ->
-          quote(do: Ecto.Query.Builder.Select.fields!(unquote(interpolated)))
-        _ when is_list(fields) ->
-          fields
-        true ->
-          Builder.error! "`take/2` in `select` expects either a literal or "
-                         "an interpolated list of atom fields"
-      end
-
-    expr = Builder.escape_var(var, vars)
-    take = Map.put(take, Builder.find_var!(var, vars), taken)
+  # map/struct(var, [:foo, :bar])
+  defp escape({tag, _, [{var, _, context}, fields]}, {params, take}, vars, env)
+       when tag in [:map, :struct] and is_atom(var) and is_atom(context) do
+    taken = escape_fields(fields, tag, env)
+    expr  = Builder.escape_var(var, vars)
+    take  = Map.put(take, Builder.find_var!(var, vars), {tag, taken})
     {expr, {params, take}}
   end
 
@@ -95,6 +82,14 @@ defmodule Ecto.Query.Builder.Select do
     {other, {params, take}}
   end
 
+  defp escape_pairs(pairs, params_take, vars, env) do
+    Enum.map_reduce pairs, params_take, fn({k, v}, acc) ->
+      {k, acc} = escape_key(k, acc, vars, env)
+      {v, acc} = escape(v, acc, vars, env)
+      {{k, v}, acc}
+    end
+  end
+
   defp escape_key(k, params_take, _vars, _env) when is_atom(k) do
     {k, params_take}
   end
@@ -102,15 +97,30 @@ defmodule Ecto.Query.Builder.Select do
     escape(k, params_take, vars, env)
   end
 
+  defp escape_fields({:^, _, [interpolated]}, tag, _env) do
+    quote do
+      Ecto.Query.Builder.Select.fields!(unquote(tag), unquote(interpolated))
+    end
+  end
+  defp escape_fields(expr, tag, env) do
+    case Macro.expand(expr, env) do
+      fields when is_list(fields) ->
+        fields
+      _ ->
+        Builder.error! "`#{tag}/2` in `select` expects either a literal or " <>
+          "an interpolated list of atom fields"
+    end
+  end
+
   @doc """
   Called at runtime to verify a field.
   """
-  def fields!(fields) do
+  def fields!(tag, fields) do
     if take?(fields) do
       fields
     else
       raise ArgumentError,
-        "expected a list of fields in `take/2` inside `select`, got: `#{inspect fields}`"
+        "expected a list of fields in `#{tag}/2` inside `select`, got: `#{inspect fields}`"
     end
   end
 
@@ -123,6 +133,15 @@ defmodule Ecto.Query.Builder.Select do
   end
 
   @doc """
+  Called at runtime for interpolated/dynamic selects.
+  """
+  def select!(query, fields, file, line) do
+    take = %{0 => {:any, fields!(:select, fields)}}
+    expr = %Ecto.Query.SelectExpr{expr: {:&, [], [0]}, take: take, file: file, line: line}
+    apply(query, expr)
+  end
+
+  @doc """
   Builds a quoted expression.
 
   The quoted expression should evaluate to a query at runtime.
@@ -130,8 +149,16 @@ defmodule Ecto.Query.Builder.Select do
   runtime work.
   """
   @spec build(Macro.t, [Macro.t], Macro.t, Macro.Env.t) :: Macro.t
+
+  def build(query, _binding, {:^, _, [var]}, env) do
+    quote do
+      Ecto.Query.Builder.Select.select!(unquote(query), unquote(var),
+                                        unquote(env.file), unquote(env.line))
+    end
+  end
+
   def build(query, binding, expr, env) do
-    binding = Builder.escape_binding(binding)
+    {query, binding} = Builder.escape_binding(query, binding)
     {expr, {params, take}} = escape(expr, binding, env)
     params = Builder.escape_params(params)
     take   = {:%{}, [], Map.to_list(take)}
@@ -149,13 +176,13 @@ defmodule Ecto.Query.Builder.Select do
   The callback applied by `build/4` to build the query.
   """
   @spec apply(Ecto.Queryable.t, term) :: Ecto.Query.t
-  def apply(query, select) do
-    query = Ecto.Queryable.to_query(query)
-
-    if query.select do
-      Builder.error! "only one select expression is allowed in query"
-    else
-      %{query | select: select}
-    end
+  def apply(%Ecto.Query{select: nil} = query, expr) do
+    %{query | select: expr}
+  end
+  def apply(%Ecto.Query{}, _expr) do
+    Builder.error! "only one select expression is allowed in query"
+  end
+  def apply(query, expr) do
+    apply(Ecto.Queryable.to_query(query), expr)
   end
 end

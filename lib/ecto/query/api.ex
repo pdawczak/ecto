@@ -9,7 +9,8 @@ defmodule Ecto.Query.API do
     * Null check functions: `is_nil/1`
     * Aggregates: `count/1`, `avg/1`, `sum/1`, `min/1`, `max/1`
     * Date/time intervals: `datetime_add/3`, `date_add/3`, `from_now/2`, `ago/2`
-    * General: `fragment/1`, `field/2`, `type/2` and `take/2`
+    * Inside select: `struct/2`, `map/2` and literals (map, tuples, lists, etc)
+    * General: `fragment/1`, `field/2` and `type/2`
 
   Note the functions in this module exist for documentation
   purposes and one should never need to invoke them directly.
@@ -77,18 +78,23 @@ defmodule Ecto.Query.API do
   @doc """
   Searches for `search` in `string`.
 
-  Translates to the underlying SQL LIKE query.
-
       from p in Post, where: like(p.body, "Chapter%")
+
+  Translates to the underlying SQL LIKE query, therefore
+  its behaviour is dependent on the database. In particular,
+  PostgreSQL will do a case-sensitive operation, while the
+  majority of other databases will be case-insensitive. For
+  performing a case-insensitive `like` in PostgreSQL, see `ilike/2`.
   """
   def like(string, search), do: doc! [string, search]
 
   @doc """
   Searches for `search` in `string` in a case insensitive fashion.
 
-  Translates to the underlying SQL ILIKE query.
-
       from p in Post, where: ilike(p.body, "Chapter%")
+
+  Translates to the underlying SQL ILIKE query. This operation is
+  only available on PostgreSQL.
   """
   def ilike(string, search), do: doc! [string, search]
 
@@ -176,20 +182,20 @@ defmodule Ecto.Query.API do
 
   ## Examples
 
-      from a in Account, where: p.expires_at < from_now(3, "months")
+      from a in Account, where: a.expires_at < from_now(3, "month")
 
   """
   def from_now(count, interval), do: doc! [count, interval]
 
   @doc """
-  Substracts the given interval from the current time in UTC.
+  Subtracts the given interval from the current time in UTC.
 
   The current time in UTC is retrieved from Elixir and
   not from the database.
 
   ## Examples
 
-      from p in Post, where: p.published_at > ago(3, "months")
+      from p in Post, where: p.published_at > ago(3, "month")
   """
   def ago(count, interval), do: doc! [count, interval]
 
@@ -203,21 +209,21 @@ defmodule Ecto.Query.API do
       def unpublished_by_title(title) do
         from p in Post,
           where: is_nil(p.published_at) and
-                 fragment("downcase(?)", p.title) == ^title
+                 fragment("lower(?)", p.title) == ^title
       end
 
-  In the example above, we are using the downcase procedure in the
+  In the example above, we are using the lower procedure in the
   database to downcase the title column.
 
   It is very important to keep in mind that Ecto is unable to do any
   type casting described above when fragments are used. You can
   however use the `type/2` function to give Ecto some hints:
 
-      fragment("downcase(?)", p.title) == type(^title, :string)
+      fragment("lower(?)", p.title) == type(^title, :string)
 
   Or even say the right side is of the same type as `p.title`:
 
-      fragment("downcase(?)", p.title) == type(^title, p.title)
+      fragment("lower(?)", p.title) == type(^title, p.title)
 
   It is possible to make use of PostgreSQL's JSON/JSONB data type
   with fragments, as well:
@@ -269,22 +275,22 @@ defmodule Ecto.Query.API do
   def field(source, field), do: doc! [source, field]
 
   @doc """
-  Used in `select` to specify which fields should be returned.
+  Used in `select` to specify which struct fields should be returned.
 
   For example, if you don't need all fields to be returned
   as part of a struct, you can filter it to include only certain
-  fields by using `take/2`:
+  fields by using `struct/2`:
 
       from p in Post,
-        select: take(p, [:title, :body])
+        select: struct(p, [:title, :body])
 
-  `take/2` can also be used to dynamically select fields:
+  `struct/2` can also be used to dynamically select fields:
 
       fields = [:title, :body]
-      from p in Post, select: take(p, ^fields)
+      from p in Post, select: struct(p, ^fields)
 
   As a convenience, `select` allows developers to take fields
-  without an explicit call to `take/2`:
+  without an explicit call to `struct/2`:
 
       from p in Post, select: [:title, :body]
 
@@ -293,19 +299,53 @@ defmodule Ecto.Query.API do
       fields = [:title, :body]
       from p in Post, select: ^fields
 
-  However, `take/2` is still useful when you want to limit
+  However, `struct/2` is still useful when you want to limit
   the fields of different structs:
 
       from(city in City, join: country in assoc(city, :country),
-           select: {take(city, [:name]), take(country, [:population])}
+           select: {struct(city, [:country_id, :name]), struct(country, [:id, :population])}
 
-  For preloads, the taken fields may be specified from the parent:
+  For preloads, the selected fields may be specified from the parent:
 
       from(city in City, preload: :country,
-           select: take(city, [:name, country: :population]))
+           select: struct(city, [:country_id, :name, country: [:id, :population]]))
 
+  **IMPORTANT**: When filtering fields for associations, you
+  MUST include the foreign keys used in the relationship,
+  otherwise Ecto will be unable to find associated records.
   """
-  def take(source, fields), do: doc! [source, fields]
+  def struct(source, fields), do: doc! [source, fields]
+
+  @doc """
+  Used in `select` to specify which fields should be returned as a map.
+
+  For example, if you don't need all fields to be returned or
+  neither need a struct, you can use `map/2` to achieve both:
+
+      from p in Post,
+        select: map(p, [:title, :body])
+
+  `map/2` can also be used to dynamically select fields:
+
+      fields = [:title, :body]
+      from p in Post, select: map(p, ^fields)
+
+  `map/2` is also useful when you want to limit the fields
+  of different structs:
+
+      from(city in City, join: country in assoc(city, :country),
+           select: {map(city, [:country_id, :name]), map(country, [:id, :population])}
+
+  For preloads, the selected fields may be specified from the parent:
+
+      from(city in City, preload: :country,
+           select: map(city, [:country_id, :name, country: [:id, :population]]))
+
+  **IMPORTANT**: When filtering fields for associations, you
+  MUST include the foreign keys used in the relationship,
+  otherwise Ecto will be unable to find associated records.
+  """
+  def map(source, fields), do: doc! [source, fields]
 
   @doc """
   Casts the given value to the given type.
@@ -315,11 +355,11 @@ defmodule Ecto.Query.API do
   though, in particular when using fragments with `fragment/1`,
   you may want to tell Ecto you are expecting a particular type:
 
-      fragment("downcase(?)", p.title) == type(^title, :string)
+      fragment("lower(?)", p.title) == type(^title, :string)
 
   It is also possible to say the type must match the same of a column:
 
-      fragment("downcase(?)", p.title) == type(^title, p.title)
+      fragment("lower(?)", p.title) == type(^title, p.title)
   """
   def type(interpolated_value, type), do: doc! [interpolated_value, type]
 

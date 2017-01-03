@@ -14,7 +14,7 @@ defmodule Ecto.Query.PlannerTest do
     schema "comments" do
       field :text, :string
       field :temp, :string, virtual: true
-      field :posted, Ecto.DateTime
+      field :posted, :naive_datetime
       field :uuid, :binary_id
       belongs_to :post, Ecto.Query.PlannerTest.Post
       has_many :post_comments, through: [:post, :comments]
@@ -29,7 +29,7 @@ defmodule Ecto.Query.PlannerTest do
       field :title, :string
       field :text, :string
       field :code, :binary
-      field :posted, Ecto.DateTime
+      field :posted, :naive_datetime
       field :visits, :integer
       field :links, {:array, Custom.Permalink}
       has_many :comments, Ecto.Query.PlannerTest.Comment
@@ -38,7 +38,7 @@ defmodule Ecto.Query.PlannerTest do
   end
 
   defp prepare(query, operation \\ :all) do
-    Planner.prepare(query, operation, Ecto.TestAdapter)
+    Planner.prepare(query, operation, Ecto.TestAdapter, 0)
   end
 
   defp normalize(query, operation \\ :all) do
@@ -49,7 +49,7 @@ defmodule Ecto.Query.PlannerTest do
     {query, params, _key} = prepare(query, operation)
     {query
      |> Planner.returning(operation == :all)
-     |> Planner.normalize(operation, Ecto.TestAdapter), params}
+     |> Planner.normalize(operation, Ecto.TestAdapter, 0), params}
   end
 
   test "prepare: merges all parameters" do
@@ -80,14 +80,7 @@ defmodule Ecto.Query.PlannerTest do
     {_query, params, _key} = prepare(Post |> where([p], p.id == ^"1"))
     assert params == [1]
 
-    exception = assert_raise Ecto.CastError, fn ->
-      prepare(Post |> where([p], p.title == ^nil))
-    end
-
-    assert Exception.message(exception) =~ "value `nil` in `where` cannot be cast to type :string"
-    assert Exception.message(exception) =~ "where: p.title == ^nil"
-
-    exception = assert_raise Ecto.CastError, fn ->
+    exception = assert_raise Ecto.Query.CastError, fn ->
       prepare(Post |> where([p], p.title == ^1))
     end
 
@@ -95,30 +88,33 @@ defmodule Ecto.Query.PlannerTest do
     assert Exception.message(exception) =~ "where: p.title == ^1"
   end
 
-  test "prepare: casts and dumps custom types" do
-    datetime = %Ecto.DateTime{year: 2015, month: 1, day: 7, hour: 21, min: 18, sec: 13, usec: 0}
-    {_query, params, _key} = prepare(Comment |> where([c], c.posted == ^datetime))
-    assert params == [{{2015, 1, 7}, {21, 18, 13, 0}}]
+  test "prepare: raises readable error on dynamic expressions/keyword lists" do
+    dynamic = dynamic([p], p.id == ^"1")
+    {_query, params, _key} = prepare(Post |> where([p], ^dynamic))
+    assert params == [1]
 
+    assert_raise Ecto.QueryError, ~r/dynamic expressions can only be interpolated/, fn ->
+      prepare(Post |> where([p], p.title == ^dynamic))
+    end
+
+    assert_raise Ecto.QueryError, ~r/keyword lists can only be interpolated/, fn ->
+      prepare(Post |> where([p], p.title == ^[foo: 1]))
+    end
+  end
+
+  test "prepare: casts and dumps custom types" do
     permalink = "1-hello-world"
     {_query, params, _key} = prepare(Post |> where([p], p.id == ^permalink))
     assert params == [1]
   end
 
-  test "prepare: casts and dumps custom types to native ones" do
-    datetime = %Ecto.DateTime{year: 2015, month: 1, day: 7, hour: 21, min: 18, sec: 13, usec: 0}
-    {_query, params, _key} = prepare(Post |> where([p], p.posted == ^datetime))
-    assert params == [{{2015, 1, 7}, {21, 18, 13, 0}}]
-  end
-
   test "prepare: casts and dumps binary ids" do
     uuid = "00010203-0405-0607-0809-0a0b0c0d0e0f"
     {_query, params, _key} = prepare(Comment |> where([c], c.uuid == ^uuid))
-    assert params == [%Ecto.Query.Tagged{type: :uuid,
-                        value: <<0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15>>}]
+    assert params == [<<0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15>>]
 
-    assert_raise Ecto.CastError,
-                 ~r/cannot dump value `"00010203-0405-0607-0809"` to type :binary_id/, fn ->
+    assert_raise Ecto.Query.CastError,
+                 ~r/`"00010203-0405-0607-0809"` cannot be dumped to type :binary_id/, fn ->
       uuid = "00010203-0405-0607-0809"
       prepare(Comment |> where([c], c.uuid == ^uuid))
     end
@@ -130,13 +126,13 @@ defmodule Ecto.Query.PlannerTest do
     assert params == [1]
 
     message = ~r"value `\"1-hello-world\"` in `where` expected to be part of an array but matched type is :string"
-    assert_raise Ecto.CastError, message, fn ->
+    assert_raise Ecto.Query.CastError, message, fn ->
       prepare(Post |> where([p], ^permalink in p.text))
     end
   end
 
   test "prepare: casts and dumps custom types in right side of in-expressions" do
-    datetime = %Ecto.DateTime{year: 2015, month: 1, day: 7, hour: 21, min: 18, sec: 13, usec: 0}
+    datetime = ~N[2015-01-07 21:18:13.0]
     {_query, params, _key} = prepare(Comment |> where([c], c.posted in ^[datetime]))
     assert params == [{{2015, 1, 7}, {21, 18, 13, 0}}]
 
@@ -144,7 +140,7 @@ defmodule Ecto.Query.PlannerTest do
     {_query, params, _key} = prepare(Post |> where([p], p.id in ^[permalink]))
     assert params == [1]
 
-    datetime = %Ecto.DateTime{year: 2015, month: 1, day: 7, hour: 21, min: 18, sec: 13, usec: 0}
+    datetime = ~N[2015-01-07 21:18:13.0]
     {_query, params, _key} = prepare(Comment |> where([c], c.posted in [^datetime]))
     assert params == [{{2015, 1, 7}, {21, 18, 13, 0}}]
 
@@ -153,10 +149,10 @@ defmodule Ecto.Query.PlannerTest do
     assert params == [1]
 
     {_query, params, _key} = prepare(Post |> where([p], p.code in [^"abcd"]))
-    assert params == [%Ecto.Query.Tagged{tag: nil, type: :binary, value: "abcd"}]
+    assert params == ["abcd"]
 
     {_query, params, _key} = prepare(Post |> where([p], p.code in ^["abcd"]))
-    assert params == [%Ecto.Query.Tagged{tag: nil, type: :binary, value: "abcd"}]
+    assert params == ["abcd"]
   end
 
   test "prepare: casts values on update_all" do
@@ -164,7 +160,7 @@ defmodule Ecto.Query.PlannerTest do
     assert params == [1]
 
     {_query, params, _key} = prepare(Post |> update([p], set: [title: ^nil]), :update_all)
-    assert params == [%Ecto.Query.Tagged{type: :string, value: nil}]
+    assert params == [nil]
 
     {_query, params, _key} = prepare(Post |> update([p], set: [title: nil]), :update_all)
     assert params == []
@@ -242,31 +238,37 @@ defmodule Ecto.Query.PlannerTest do
     end
   end
 
-  test "prepare: generates a cache key if appropriate" do
+  test "prepare: generates a cache key" do
     {_query, _params, key} = prepare(from(Post, []))
-    assert key == [:all, {"posts", Post, 112914533}]
+    assert key == [:all, 0, {"posts", Post, 27727487}]
 
-    query = from(p in Post, select: 1, lock: "foo", where: is_nil(nil),
+    query = from(p in Post, select: 1, lock: "foo", where: is_nil(nil), or_where: is_nil(nil),
                             join: c in Comment, preload: :comments)
     {_query, _params, key} = prepare(%{query | prefix: "foo"})
-    assert key == [:all,
+    assert key == [:all, 0,
                    {:lock, "foo"},
                    {:prefix, "foo"},
-                   {:where, [{:is_nil, [], [nil]}]},
-                   {:join, [{:inner, {"comments", Ecto.Query.PlannerTest.Comment, 53730846}, true}]},
-                   {"posts", Ecto.Query.PlannerTest.Post, 112914533},
+                   {:where, [{:and, {:is_nil, [], [nil]}}, {:or, {:is_nil, [], [nil]}}]},
+                   {:join, [{:inner, {"comments", Ecto.Query.PlannerTest.Comment, 6996781}, true}]},
+                   {"posts", Ecto.Query.PlannerTest.Post, 27727487},
                    {:select, 1}]
+  end
 
+  test "prepare: generates a cache key for in based on the adapter" do
     query = from(p in Post, where: p.id in ^[1, 2, 3])
-    {_query, _params, key} = prepare(query)
+
+    {_query, _params, key} = Planner.prepare(query, :all, Ecto.TestAdapter, 0)
     assert key == :nocache
+
+    {_query, _params, key} = Planner.prepare(query, :all, Ecto.Adapters.Postgres, 0)
+    assert key != :nocache
   end
 
   test "prepare: subqueries" do
     {query, params, key} = prepare(from(subquery(Post), []))
     assert %{query: %Ecto.Query{}, params: []} = query.from
     assert params == []
-    assert key == [:all, [:all, {"posts", Ecto.Query.PlannerTest.Post, 112914533}]]
+    assert key == [:all, 0, [:all, 0, {"posts", Ecto.Query.PlannerTest.Post, 27727487}]]
 
     posts = from(p in Post, where: p.title == ^"hello")
     query = from(c in Comment, join: p in subquery(posts), on: c.post_id == p.id)
@@ -274,7 +276,7 @@ defmodule Ecto.Query.PlannerTest do
     assert {"comments", Ecto.Query.PlannerTest.Comment} = query.from
     assert [%{source: %{query: %Ecto.Query{}, params: ["hello"]}}] = query.joins
     assert params == ["hello"]
-    assert [[], {:join, [{:inner, [:all|_], _}]}, {"comments", _, _}] = key
+    assert [[], 0, {:join, [{:inner, [:all|_], _}]}, {"comments", _, _}] = key
   end
 
   test "prepare: subqueries with association joins" do
@@ -296,41 +298,37 @@ defmodule Ecto.Query.PlannerTest do
 
   test "prepare: subqueries validates select fields" do
     query = prepare(from(subquery(Post), [])) |> elem(0)
-    assert [{:id, 0}, {:title, 0} | _] = query.from.types
+    assert [{:id, {{:., [], [{:&, [], [0]}, :id]}, [], []}},
+            {:title, {{:., [], [{:&, [], [0]}, :title]}, [], []}} | _] = query.from.fields
 
     query = from p in "posts", select: p.code
     query = prepare(from(subquery(query), [])) |> elem(0)
-    assert [code: 0] = query.from.types
+    assert [code: {{:., [], [{:&, [], [0]}, :code]}, [], []}] = query.from.fields
 
     query = from p in Post, select: p.code
     query = prepare(from(subquery(query), [])) |> elem(0)
-    assert [code: 0] = query.from.types
+    assert [code: {{:., [], [{:&, [], [0]}, :code]}, [], []}] = query.from.fields
 
-    query = from p in Post, join: c in assoc(p, :comments), select: {p.code, c}
+    query = from p in Post, join: c in assoc(p, :comments), select: %{c: p.code}
     query = prepare(from(subquery(query), [])) |> elem(0)
-    assert [{:code, 0}, {:id, 1} | _] = query.from.types
-
-    query = from p in Post, select: 1
-    assert_raise Ecto.SubQueryError, ~r/subquery must select at least one source/, fn ->
-      prepare(from(subquery(query), []))
-    end
+    assert [c: {{:., [], [{:&, [], [0]}, :code]}, [], []}] = query.from.fields
 
     query = from p in Post, select: fragment("? + ?", p.id, p.id)
-    assert_raise Ecto.SubQueryError, ~r/subquery can only select sources/, fn ->
+    assert_raise Ecto.SubQueryError, ~r/subquery must select a source \(t\), a field \(t\.field\) or a map/, fn ->
       prepare(from(subquery(query), []))
     end
 
-    query = from p in Post, join: c in assoc(p, :comments), select: {p, c}
-    assert_raise Ecto.SubQueryError, ~r/`id` is selected from two different sources in subquery/, fn ->
+    query = from p in Post, select: %{p.id => p.title}
+    assert_raise Ecto.SubQueryError, ~r/only atom keys are allowed/, fn ->
       prepare(from(subquery(query), []))
     end
   end
 
   test "prepare: allows type casting from subquery types" do
     query = subquery(from p in Post, join: c in assoc(p, :comments),
-                                     select: {p.id, p.title, c.posted})
+                                     select: %{id: p.id, title: p.title, posted: c.posted})
 
-    datetime = %Ecto.DateTime{year: 2015, month: 1, day: 7, hour: 21, min: 18, sec: 13, usec: 0}
+    datetime = ~N[2015-01-07 21:18:13.0]
     {_query, params, _key} = prepare(query |> where([c], c.posted == ^datetime))
     assert params == [{{2015, 1, 7}, {21, 18, 13, 0}}]
 
@@ -338,7 +336,7 @@ defmodule Ecto.Query.PlannerTest do
     {_query, params, _key} = prepare(query |> where([p], p.id == ^permalink))
     assert params == [1]
 
-    assert_raise Ecto.CastError, ~r/value `1` in `where` cannot be cast to type :string in query/, fn ->
+    assert_raise Ecto.Query.CastError, ~r/value `1` in `where` cannot be cast to type :string in query/, fn ->
       prepare(query |> where([p], p.title == ^1))
     end
 
@@ -349,14 +347,14 @@ defmodule Ecto.Query.PlannerTest do
 
   test "prepare: wraps subquery errors" do
     exception = assert_raise Ecto.SubQueryError, fn ->
-      query = Post |> where([p], p.title == ^nil)
+      query = Post |> where([p], p.title == ^1)
       prepare(from(subquery(query), []))
     end
 
-    assert %Ecto.CastError{} = exception.exception
+    assert %Ecto.Query.CastError{} = exception.exception
     assert Exception.message(exception) =~ "the following exception happened when compiling a subquery."
-    assert Exception.message(exception) =~ "value `nil` in `where` cannot be cast to type :string"
-    assert Exception.message(exception) =~ "where: p.title == ^nil"
+    assert Exception.message(exception) =~ "value `1` in `where` cannot be cast to type :string"
+    assert Exception.message(exception) =~ "where: p.title == ^1"
     assert Exception.message(exception) =~ "from p in subquery(from p in Ecto.Query.PlannerTest.Post"
   end
 
@@ -379,13 +377,13 @@ defmodule Ecto.Query.PlannerTest do
            %Ecto.Query.Tagged{type: :integer, value: {:^, [], [0]}, tag: :integer}
     assert params == [1]
 
-    assert_raise Ecto.CastError, ~r/value `"1"` in `select` cannot be cast to type Ecto.DateTime/, fn ->
-      from(Post, []) |> select([p], type(^"1", Ecto.DateTime)) |> normalize
+    assert_raise Ecto.Query.CastError, ~r/value `"1"` in `select` cannot be cast to type Ecto.UUID/, fn ->
+      from(Post, []) |> select([p], type(^"1", Ecto.UUID)) |> normalize
     end
   end
 
   test "normalize: dumps in query expressions" do
-    assert_raise Ecto.QueryError, ~r"cannot dump value", fn ->
+    assert_raise Ecto.QueryError, ~r"cannot be dumped", fn ->
       normalize(from p in Post, where: p.posted == "2014-04-17 00:00:00")
     end
   end
@@ -402,7 +400,7 @@ defmodule Ecto.Query.PlannerTest do
     query = from(Post, []) |> where([p], p.id in [1, 2, 3])
     normalize(query)
 
-    message = ~r"cannot dump value `1` to type :string"
+    message = ~r"value `1` cannot be dumped to type :string"
     assert_raise Ecto.QueryError, message, fn ->
       query = from(Comment, []) |> where([c], c.text in [1, 2, 3])
       normalize(query)
@@ -419,7 +417,7 @@ defmodule Ecto.Query.PlannerTest do
     assert params == [1, 3]
 
     {query, params} = where(Post, [p], p.id in ^[]) |> normalize_with_params()
-    assert Macro.to_string(hd(query.wheres).expr) == "&0.id() in []"
+    assert Macro.to_string(hd(query.wheres).expr) == "&0.id() in ^(0, 0)"
     assert params == []
 
     {query, params} = where(Post, [p], p.id in ^[1, 2, 3]) |> normalize_with_params()
@@ -429,7 +427,7 @@ defmodule Ecto.Query.PlannerTest do
     {query, params} = where(Post, [p], p.title == ^"foo" and p.id in ^[1, 2, 3] and
                                        p.title == ^"bar") |> normalize_with_params()
     assert Macro.to_string(hd(query.wheres).expr) ==
-           "&0.title() == ^0 and &0.id() in ^(1, 3) and &0.title() == ^4"
+           "&0.title() == ^0 and &0.id() in ^(1, 3) and &0.title() == ^2"
     assert params == ["foo", 1, 2, 3, "bar"]
   end
 
@@ -471,12 +469,16 @@ defmodule Ecto.Query.PlannerTest do
             {{:., [], [{:&, [], [0]}, :title]}, [ecto_type: :string], []}]
   end
 
-  test "normalize: select with take" do
-    query = Post |> select([p], take(p, [:id, :title])) |> normalize()
+  test "normalize: select with struct/2" do
+    assert_raise Ecto.QueryError, ~r"struct/2 in select expects a source with a schema", fn ->
+      "posts" |> select([p], struct(p, [:id, :title])) |> normalize()
+    end
+
+    query = Post |> select([p], struct(p, [:id, :title])) |> normalize()
     assert query.select.expr == {:&, [], [0]}
     assert query.select.fields == [{:&, [], [0, [:id, :title], 2]}]
 
-    query = Post |> select([p], {take(p, [:id, :title]), p.title}) |> normalize()
+    query = Post |> select([p], {struct(p, [:id, :title]), p.title}) |> normalize()
     assert query.select.fields ==
            [{:&, [], [0, [:id, :title], 2]},
             {{:., [], [{:&, [], [0]}, :title]}, [ecto_type: :string], []}]
@@ -484,18 +486,18 @@ defmodule Ecto.Query.PlannerTest do
     query =
       Post
       |> join(:inner, [_], c in Comment)
-      |> select([p, c], {p, take(c, [:id, :text])})
+      |> select([p, c], {p, struct(c, [:id, :text])})
       |> normalize()
     assert query.select.fields ==
            [{:&, [], [0, [:id, :title, :text, :code, :posted, :visits, :links], 7]},
             {:&, [], [1, [:id, :text], 2]}]
   end
 
-  test "normalize: select with take on assoc" do
+  test "normalize: select with struct/2 on assoc" do
     query =
       Post
       |> join(:inner, [_], c in Comment)
-      |> select([p, c], take(p, [:id, :title, comments: [:id, :text]]))
+      |> select([p, c], struct(p, [:id, :title, comments: [:id, :text]]))
       |> preload([p, c], comments: c)
       |> normalize()
     assert query.select.expr == {:&, [], [0]}
@@ -506,7 +508,53 @@ defmodule Ecto.Query.PlannerTest do
     query =
       Post
       |> join(:inner, [_], c in Comment)
-      |> select([p, c], take(p, [:id, :title, comments: [:id, :text, post: :id], extra_comments: :id]))
+      |> select([p, c], struct(p, [:id, :title, comments: [:id, :text, post: :id], extra_comments: :id]))
+      |> preload([p, c], comments: {c, post: p}, extra_comments: c)
+      |> normalize()
+    assert query.select.expr == {:&, [], [0]}
+    assert query.select.fields ==
+           [{:&, [], [0, [:id, :title], 2]},
+            {:&, [], [1, [:id], 1]},
+            {:&, [], [1, [:id, :text], 2]},
+            {:&, [], [0, [:id], 1]}]
+  end
+
+  test "normalize: select with map/2" do
+    query = Post |> select([p], map(p, [:id, :title])) |> normalize()
+    assert query.select.expr == {:&, [], [0]}
+    assert query.select.fields == [{:&, [], [0, [:id, :title], 2]}]
+
+    query = Post |> select([p], {map(p, [:id, :title]), p.title}) |> normalize()
+    assert query.select.fields ==
+           [{:&, [], [0, [:id, :title], 2]},
+            {{:., [], [{:&, [], [0]}, :title]}, [ecto_type: :string], []}]
+
+    query =
+      Post
+      |> join(:inner, [_], c in Comment)
+      |> select([p, c], {p, map(c, [:id, :text])})
+      |> normalize()
+    assert query.select.fields ==
+           [{:&, [], [0, [:id, :title, :text, :code, :posted, :visits, :links], 7]},
+            {:&, [], [1, [:id, :text], 2]}]
+  end
+
+  test "normalize: select with map/2 on assoc" do
+    query =
+      Post
+      |> join(:inner, [_], c in Comment)
+      |> select([p, c], map(p, [:id, :title, comments: [:id, :text]]))
+      |> preload([p, c], comments: c)
+      |> normalize()
+    assert query.select.expr == {:&, [], [0]}
+    assert query.select.fields ==
+           [{:&, [], [0, [:id, :title], 2]},
+            {:&, [], [1, [:id, :text], 2]}]
+
+    query =
+      Post
+      |> join(:inner, [_], c in Comment)
+      |> select([p, c], map(p, [:id, :title, comments: [:id, :text, post: :id], extra_comments: :id]))
       |> preload([p, c], comments: {c, post: p}, extra_comments: c)
       |> normalize()
     assert query.select.expr == {:&, [], [0]}
@@ -521,6 +569,11 @@ defmodule Ecto.Query.PlannerTest do
     message = ~r"the binding used in `from` must be selected in `select` when using `preload`"
     assert_raise Ecto.QueryError, message, fn ->
       Post |> preload(:hello) |> select([p], p.title) |> normalize
+    end
+
+    message = ~r"cannot prepare query because it has specified more bindings than"
+    assert_raise ArgumentError, message, fn ->
+      Post |> preload([p, c], comments: c) |> normalize
     end
   end
 
@@ -537,6 +590,13 @@ defmodule Ecto.Query.PlannerTest do
     message = ~r"requires an inner or left join, got right join"
     assert_raise Ecto.QueryError, message, fn ->
       query = from(p in Post, right_join: c in assoc(p, :comments), preload: [comments: c])
+      normalize(query)
+    end
+  end
+
+  test "normalize: fragments do not support preloads" do
+    query = from p in Post, join: c in fragment("..."), preload: [comments: c]
+    assert_raise Ecto.QueryError, ~r/can only preload sources with a schema/, fn ->
       normalize(query)
     end
   end
@@ -626,25 +686,22 @@ defmodule Ecto.Query.PlannerTest do
   end
 
   test "normalize: merges subqueries fields when requested" do
-    query = from p in Post, select: {p.id, p.title}
-    query = normalize(from(subquery(query), []))
+    subquery = from p in Post, select: %{id: p.id, title: p.title}
+    query = normalize(from(subquery(subquery), []))
     assert query.select.fields == [{:&, [], [0, [:id, :title], 2]}]
 
-    query = from p in Post, select: {p.id, p.title}
-    query = normalize(from(p in subquery(query), select: p.title))
+    query = normalize(from(p in subquery(subquery), select: p.title))
     assert query.select.fields == [{{:., [], [{:&, [], [0]}, :title]}, [ecto_type: :string], []}]
 
-    query = from p in Post, select: {p.id, p.title}
-    query = normalize(from(c in Comment, join: p in subquery(query), select: p))
+    query = normalize(from(c in Comment, join: p in subquery(subquery), select: p))
     assert query.select.fields == [{:&, [], [1, [:id, :title], 2]}]
 
-    query = from p in Post, select: {p.id, p.title}
-    query = normalize(from(c in Comment, join: p in subquery(query), select: p.title))
+    query = normalize(from(c in Comment, join: p in subquery(subquery), select: p.title))
     assert query.select.fields == [{{:., [], [{:&, [], [1]}, :title]}, [ecto_type: :string], []}]
 
-    query = from p in Post, select: {p.id, p.title}
-    assert_raise Ecto.QueryError, ~r/cannot take multiple fields on fragment or subquery sources in query/, fn ->
-      normalize(from(p in subquery(query), select: [:title]))
+    subquery = from p in Post, select: %{id: p.id, title: p.title}
+    assert_raise Ecto.QueryError, ~r/it is not possible to return a map\/struct subset of a subquery/, fn ->
+      normalize(from(p in subquery(subquery), select: [:title]))
     end
   end
 end

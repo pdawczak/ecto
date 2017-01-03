@@ -26,8 +26,12 @@ defmodule Ecto.Adapters.SQL do
       end
 
       @doc false
-      def application do
-        @adapter
+      def ensure_all_started(repo, type) do
+        {_, opts} = repo.__pool__
+        with {:ok, pool} <- DBConnection.ensure_all_started(opts, type),
+             {:ok, adapter} <- Application.ensure_all_started(@adapter, type),
+             # We always return the adapter to force it to be restarted if necessary
+             do: {:ok, pool ++ List.delete(adapter, @adapter) ++ [@adapter]}
       end
 
       @doc false
@@ -38,19 +42,19 @@ defmodule Ecto.Adapters.SQL do
       ## Types
 
       @doc false
-      def autogenerate(:id), do: nil
-      def autogenerate(:embed_id), do: Ecto.UUID.autogenerate()
-      def autogenerate(:binary_id), do: Ecto.UUID.autogenerate()
+      def autogenerate(:id),        do: nil
+      def autogenerate(:embed_id),  do: Ecto.UUID.generate()
+      def autogenerate(:binary_id), do: Ecto.UUID.bingenerate()
 
       @doc false
       def loaders({:embed, _} = type, _), do: [&Ecto.Adapters.SQL.load_embed(type, &1)]
-      def loaders(:binary_id, type), do: [Ecto.UUID, type]
-      def loaders(_, type), do: [type]
+      def loaders(:binary_id, type),      do: [Ecto.UUID, type]
+      def loaders(_, type),               do: [type]
 
       @doc false
       def dumpers({:embed, _} = type, _), do: [&Ecto.Adapters.SQL.dump_embed(type, &1)]
-      def dumpers(:binary_id, type), do: [type, Ecto.UUID]
-      def dumpers(_, type), do: [type]
+      def dumpers(:binary_id, type),      do: [type, Ecto.UUID]
+      def dumpers(_, type),               do: [type]
 
       ## Query
 
@@ -68,15 +72,26 @@ defmodule Ecto.Adapters.SQL do
       end
 
       @doc false
-      def insert_all(repo, %{source: {prefix, source}}, header, rows, returning, opts) do
-        Ecto.Adapters.SQL.insert_all(repo, @conn, prefix, source, header, rows, returning, opts)
+      def stream(repo, meta, query, params, process, opts) do
+        Ecto.Adapters.SQL.stream(repo, meta, query, params, process, opts)
       end
 
       @doc false
-      def insert(repo, %{source: {prefix, source}}, params, returning, opts) do
+      def insert_all(repo, %{source: {prefix, source}}, header, rows,
+                     {_, conflict_params, _} = on_conflict, returning, opts) do
+        {rows, params} = Ecto.Adapters.SQL.unzip_inserts(header, rows)
+        sql = @conn.insert(prefix, source, header, rows, on_conflict, returning)
+        %{rows: rows, num_rows: num} =
+          Ecto.Adapters.SQL.query!(repo, sql, Enum.reverse(params) ++ conflict_params, opts)
+        {num, rows}
+      end
+
+      @doc false
+      def insert(repo, %{source: {prefix, source}}, params,
+                 {kind, conflict_params, _} = on_conflict, returning, opts) do
         {fields, values} = :lists.unzip(params)
-        sql = @conn.insert(prefix, source, fields, [fields], returning)
-        Ecto.Adapters.SQL.struct(repo, @conn, sql, values, returning, opts)
+        sql = @conn.insert(prefix, source, fields, [fields], on_conflict, returning)
+        Ecto.Adapters.SQL.struct(repo, @conn, sql, values ++ conflict_params, kind, returning, opts)
       end
 
       @doc false
@@ -84,14 +99,14 @@ defmodule Ecto.Adapters.SQL do
         {fields, values1} = :lists.unzip(fields)
         {filter, values2} = :lists.unzip(filter)
         sql = @conn.update(prefix, source, fields, filter, returning)
-        Ecto.Adapters.SQL.struct(repo, @conn, sql, values1 ++ values2, returning, opts)
+        Ecto.Adapters.SQL.struct(repo, @conn, sql, values1 ++ values2, :raise, returning, opts)
       end
 
       @doc false
       def delete(repo, %{source: {prefix, source}}, filter, opts) do
         {filter, values} = :lists.unzip(filter)
         sql = @conn.delete(prefix, source, filter, [])
-        Ecto.Adapters.SQL.struct(repo, @conn, sql, values, [], opts)
+        Ecto.Adapters.SQL.struct(repo, @conn, sql, values, :raise, [], opts)
       end
 
       ## Transaction
@@ -115,13 +130,17 @@ defmodule Ecto.Adapters.SQL do
 
       @doc false
       def execute_ddl(repo, definition, opts) do
-        sql = @conn.execute_ddl(definition)
-        Ecto.Adapters.SQL.query!(repo, sql, [], opts)
+        sqls = @conn.execute_ddl(definition)
+
+        for sql <- List.wrap(sqls) do
+          Ecto.Adapters.SQL.query!(repo, sql, [], opts)
+        end
+
         :ok
       end
 
-      defoverridable [prepare: 2, execute: 6, insert: 5, update: 6, delete: 4, insert_all: 6,
-                      execute_ddl: 3, loaders: 2, dumpers: 2, autogenerate: 1]
+      defoverridable [prepare: 2, execute: 6, insert: 6, update: 6, delete: 4, insert_all: 7,
+                      execute_ddl: 3, loaders: 2, dumpers: 2, autogenerate: 1, ensure_all_started: 2]
     end
   end
 
@@ -150,9 +169,9 @@ defmodule Ecto.Adapters.SQL do
     queryable
     |> Ecto.Queryable.to_query()
     |> Ecto.Query.Planner.returning(kind == :all)
-    |> Ecto.Query.Planner.query(kind, repo, adapter)
+    |> Ecto.Query.Planner.query(kind, repo, adapter, 0)
     |> case do
-      {_meta, {:cached, {_id, cached}}, params} ->
+      {_meta, {:cached, _reset, {_id, cached}}, params} ->
         {String.Chars.to_string(cached), params}
       {_meta, {:cache, _update, {_id, prepared}}, params} ->
         {prepared, params}
@@ -166,8 +185,8 @@ defmodule Ecto.Adapters.SQL do
   """
   @spec query!(Ecto.Repo.t, String.t, [term], Keyword.t) ::
                %{rows: nil | [tuple], num_rows: non_neg_integer} | no_return
-  def query!(repo, sql, params, opts \\ []) do
-    query!(repo, sql, params, fn x -> x end, opts)
+  def query!(repo, sql, params \\ [], opts \\ []) do
+    query!(repo, sql, map_params(params), fn x -> x end, opts)
   end
 
   defp query!(repo, sql, params, mapper, opts) do
@@ -207,8 +226,8 @@ defmodule Ecto.Adapters.SQL do
   """
   @spec query(Ecto.Repo.t, String.t, [term], Keyword.t) ::
               {:ok, %{rows: nil | [tuple], num_rows: non_neg_integer}} | {:error, Exception.t}
-  def query(repo, sql, params, opts \\ []) do
-    query(repo, sql, params, fn x -> x end, opts)
+  def query(repo, sql, params \\ [], opts \\ []) do
+    query(repo, sql, map_params(params), fn x -> x end, opts)
   end
 
   defp query(repo, sql, params, mapper, opts) do
@@ -220,7 +239,34 @@ defmodule Ecto.Adapters.SQL do
     conn = get_conn(pool) || pool
     opts = [decode_mapper: mapper] ++ with_log(repo, params, opts ++ default_opts)
     args = args ++ [params, opts]
-    apply(repo.__sql__, callback, [conn | args])
+    try do
+      apply(repo.__sql__, callback, [conn | args])
+    rescue
+      err in DBConnection.OwnershipError ->
+        message = err.message <> "\nSee Ecto.Adapters.SQL.Sandbox docs for more information."
+        reraise %{err | message: message}, System.stacktrace
+    end
+  end
+
+  defp put_source(opts, %{sources: sources}) when tuple_size(elem(sources, 0)) == 2 do
+    {source, _} = elem(sources, 0)
+    Keyword.put(opts, :source, source)
+  end
+  defp put_source(opts, _) do
+    opts
+  end
+
+  defp map_params(params) do
+    Enum.map params, fn
+      %{__struct__: _} = value ->
+        {:ok, value} = Ecto.DataType.dump(value)
+        value
+      [_|_] = value ->
+        {:ok, value} = Ecto.DataType.dump(value)
+        value
+      value ->
+        value
+    end
   end
 
   ## Worker
@@ -231,36 +277,54 @@ defmodule Ecto.Adapters.SQL do
   @doc false
   def __before_compile__(conn, env) do
     config = Module.get_attribute(env.module, :config)
-    pool   = Keyword.get(config, :pool, DBConnection.Poolboy)
-    name   = Keyword.get(config, :pool_name, default_pool_name(env.module, config))
-
-    config =
-      config
-      |> Keyword.delete(:name)
-      |> Keyword.put(:pool, normalize_pool(pool))
-      |> Keyword.put_new(:timeout, @timeout)
-      |> Keyword.put_new(:pool_timeout, @pool_timeout)
-
-    if pool == Ecto.Adapters.SQL.Sandbox and config[:pool_size] == 1 do
-      IO.puts :stderr, "warning: setting the :pool_size to 1 for #{inspect env.module} " <>
-                       "when using the Ecto.Adapters.SQL.Sandbox pool is deprecated and " <>
-                       "won't work as expected. Please remove the :pool_size configuration " <>
-                       "or set it to a reasonable number like 10"
-    end
+    pool_name = pool_name(env.module, config)
+    norm_config = normalize_config(config)
 
     quote do
       @doc false
       def __sql__, do: unquote(conn)
 
       @doc false
-      def __pool__, do: {unquote(name), unquote(Macro.escape(config))}
+      def __pool__, do: {unquote(pool_name), unquote(Macro.escape(norm_config))}
+
+      @doc """
+      A convenience function for SQL-based repositories that executes the given query.
+
+      See `Ecto.Adapters.SQL.query/3` for more information.
+      """
+      def query(sql, params \\ [], opts \\ []) do
+        Ecto.Adapters.SQL.query(__MODULE__, sql, params, opts)
+      end
+
+      @doc """
+      A convenience function for SQL-based repositories that executes the given query.
+
+      See `Ecto.Adapters.SQL.query/3` for more information.
+      """
+      def query!(sql, params \\ [], opts \\ []) do
+        Ecto.Adapters.SQL.query!(__MODULE__, sql, params, opts)
+      end
+
+      defoverridable [__pool__: 0]
     end
+  end
+
+  defp normalize_config(config) do
+    config
+    |> Keyword.delete(:name)
+    |> Keyword.update(:pool, DBConnection.Poolboy, &normalize_pool/1)
+    |> Keyword.put_new(:timeout, @timeout)
+    |> Keyword.put_new(:pool_timeout, @pool_timeout)
   end
 
   defp normalize_pool(Ecto.Adapters.SQL.Sandbox),
     do: DBConnection.Ownership
   defp normalize_pool(pool),
     do: pool
+
+  defp pool_name(module, config) do
+    Keyword.get(config, :pool_name, default_pool_name(module, config))
+  end
 
   defp default_pool_name(repo, config) do
     Module.concat(Keyword.get(config, :name, repo), Pool)
@@ -282,24 +346,20 @@ defmodule Ecto.Adapters.SQL do
       """
     end
 
-    {pool_name, pool_opts} = repo.__pool__
-    opts = [name: pool_name] ++ Keyword.delete(opts, :pool) ++ pool_opts
-
-    opts =
-      if function_exported?(repo, :after_connect, 1) and not Keyword.has_key?(opts, :after_connect) do
-        IO.puts :stderr, "warning: #{inspect repo}.after_connect/1 is deprecated. If you want to " <>
-                         "perform some action after connecting, please set after_connect: {module, fun, args}" <>
-                         "in your repository configuration"
-        Keyword.put(opts, :after_connect, {repo, :after_connect, []})
-      else
-        opts
+    # Check if the pool options should overridden
+    {pool_name, pool_opts} =
+      case Keyword.fetch(opts, :pool) do
+        {:ok, pool} when pool != Ecto.Adapters.SQL.Sandbox ->
+          {pool_name(repo, opts), opts}
+        _ ->
+          repo.__pool__
       end
 
+    opts = [name: pool_name] ++ Keyword.delete(opts, :pool) ++ pool_opts
     connection.child_spec(opts)
   end
 
   ## Types
-
   @doc false
   def load_embed(type, value) do
     Ecto.Type.load(type, value, fn
@@ -319,14 +379,7 @@ defmodule Ecto.Adapters.SQL do
   ## Query
 
   @doc false
-  def insert_all(repo, conn, prefix, source, header, rows, returning, opts) do
-    {rows, params} = unzip_inserts(header, rows)
-    sql = conn.insert(prefix, source, header, rows, returning)
-    %{rows: rows, num_rows: num} = query!(repo, sql, Enum.reverse(params), nil, opts)
-    {num, rows}
-  end
-
-  defp unzip_inserts(header, rows) do
+  def unzip_inserts(header, rows) do
     Enum.map_reduce rows, [], fn fields, params ->
       Enum.map_reduce header, params, fn key, acc ->
         case :lists.keyfind(key, 1, fields) do
@@ -338,25 +391,38 @@ defmodule Ecto.Adapters.SQL do
   end
 
   @doc false
-  def execute(repo, _meta, {:cache, update, {id, prepared}}, params, nil, opts) do
+  def execute(repo, meta, prepared, params, mapper, opts) do
+    do_execute(repo, meta, prepared, params, mapper, put_source(opts, meta))
+  end
+
+  defp do_execute(repo, _meta, {:cache, update, {id, prepared}}, params, nil, opts) do
     execute_and_cache(repo, id, update, prepared, params, nil, opts)
   end
 
-  def execute(repo, %{fields: fields}, {:cache, update, {id, prepared}}, params, process, opts) do
+  defp do_execute(repo, %{fields: fields}, {:cache, update, {id, prepared}}, params, process, opts) do
     mapper = &process_row(&1, process, fields)
     execute_and_cache(repo, id, update, prepared, params, mapper, opts)
   end
 
-  def execute(repo, _meta, {_, {_id, prepared_or_cached}}, params, nil, opts) do
+  defp do_execute(repo, _meta, {:cached, reset, {id, cached}}, params, nil, opts) do
+    execute_or_reset(repo, id, reset, cached, params, nil, opts)
+  end
+
+ defp do_execute(repo, %{fields: fields}, {:cached, reset, {id, cached}}, params, process, opts) do
+    mapper = &process_row(&1, process, fields)
+    execute_or_reset(repo, id, reset, cached, params, mapper, opts)
+  end
+
+  defp do_execute(repo, _meta, {:nocache, {_id, prepared}}, params, nil, opts) do
     %{rows: rows, num_rows: num} =
-      sql_call!(repo, :execute, [prepared_or_cached], params, nil, opts)
+      sql_call!(repo, :execute, [prepared], params, nil, opts)
     {num, rows}
   end
 
-  def execute(repo, %{fields: fields}, {_, {_id, prepared_or_cached}}, params, process, opts) do
+  defp do_execute(repo, %{fields: fields}, {:nocache, {_id, prepared}}, params, process, opts) do
     mapper = &process_row(&1, process, fields)
     %{rows: rows, num_rows: num} =
-      sql_call!(repo, :execute, [prepared_or_cached], params, mapper, opts)
+      sql_call!(repo, :execute, [prepared], params, mapper, opts)
     {num, rows}
   end
 
@@ -364,29 +430,141 @@ defmodule Ecto.Adapters.SQL do
     name = "ecto_" <> Integer.to_string(id)
     case sql_call(repo, :prepare_execute, [name, prepared], params, mapper, opts) do
       {:ok, query, %{num_rows: num, rows: rows}} ->
-        update.({0, query})
+        update.({id, query})
         {num, rows}
       {:error, err} ->
         raise err
     end
   end
 
+  defp execute_or_reset(repo, id, reset, cached, params, mapper, opts) do
+    case sql_call(repo, :execute, [cached], params, mapper, opts) do
+      {:ok, %{num_rows: num, rows: rows}} ->
+        {num, rows}
+      {:error, err} ->
+        raise err
+      {:reset, err} ->
+        reset.({id, String.Chars.to_string(cached)})
+        raise err
+    end
+  end
+
   defp sql_call!(repo, callback, args, params, mapper, opts) do
     case sql_call(repo, callback, args, params, mapper, opts) do
-      {:ok, res}        -> res
-      {:error, err}     -> raise err
+      {:ok, res}    -> res
+      {:error, err} -> raise err
+    end
+  end
+
+  @doc """
+  Returns a stream that runs a custom SQL query on given repo when reduced.
+
+  In case of success it is a enumerable containing maps with at least two keys:
+
+    * `:num_rows` - the number of rows affected
+
+    * `:rows` - the result set as a list. `nil` may be returned
+      instead of the list if the command does not yield any row
+      as result (but still yields the number of affected rows,
+      like a `delete` command without returning would)
+
+  In case of failure it raises an exception.
+
+  If the adapter supports a collectable stream, the stream may also be used as
+  the collectable in `Enum.into/3`. Behaviour depends on the adapter.
+
+  ## Options
+
+    * `:timeout` - The time in milliseconds to wait for a query to finish,
+      `:infinity` will wait indefinitely (default: 15_000)
+    * `:pool_timeout` - The time in milliseconds to wait for a call to the pool
+      to finish, `:infinity` will wait indefinitely (default: 5_000)
+    * `:log` - When false, does not log the query
+    * `:max_rows` - The number of rows to load from the database as we stream
+
+  ## Examples
+
+      iex> Ecto.Adapters.SQL.stream(MyRepo, "SELECT $1::integer + $2", [40, 2]) |> Enum.to_list()
+      [%{rows: [[42]], num_rows: 1}]
+
+  """
+  @spec stream(Ecto.Repo.t, String.t, [term], Keyword.t) :: Enum.t
+  def stream(repo, sql, params \\ [], opts \\ []) do
+    Ecto.Adapters.SQL.Stream.__build__(repo, sql, params, fn x -> x end, opts)
+  end
+
+  @doc false
+  def stream(repo, meta, prepared, params, mapper, opts) do
+    do_stream(repo, meta, prepared, params, mapper, put_source(opts, meta))
+  end
+
+  def do_stream(repo, _meta, {:cache, _, {_, prepared}}, params, nil, opts) do
+    prepare_stream(repo, prepared, params, nil, opts)
+  end
+
+  def do_stream(repo, %{fields: fields}, {:cache, _, {_, prepared}}, params, process, opts) do
+    mapper = &process_row(&1, process, fields)
+    prepare_stream(repo, prepared, params, mapper, opts)
+  end
+
+  def do_stream(repo, _, {:cached, _, {_, cached}}, params, nil, opts) do
+    prepare_stream(repo, String.Chars.to_string(cached), params, nil, opts)
+  end
+
+  def do_stream(repo, %{fields: fields}, {:cached, _, {_, cached}}, params, process, opts) do
+    mapper = &process_row(&1, process, fields)
+    prepare_stream(repo, String.Chars.to_string(cached), params, mapper, opts)
+  end
+
+  def do_stream(repo, _meta, {:nocache, {_id, prepared}}, params, nil, opts) do
+    prepare_stream(repo, prepared, params, nil, opts)
+  end
+
+  def do_stream(repo, %{fields: fields}, {:nocache, {_id, prepared}}, params, process, opts) do
+    mapper = &process_row(&1, process, fields)
+    prepare_stream(repo, prepared, params, mapper, opts)
+  end
+
+  defp prepare_stream(repo, prepared, params, mapper, opts) do
+    Ecto.Adapters.SQL.Stream.__build__(repo, prepared, params, mapper, opts)
+    |> Stream.map(fn(%{num_rows: nrows, rows: rows}) -> {nrows, rows} end)
+  end
+
+  @doc false
+  def reduce(repo, statement, params, mapper, opts, acc, fun) do
+    {pool, default_opts} = repo.__pool__
+    opts = [decode_mapper: mapper] ++ with_log(repo, params, opts ++ default_opts)
+    case get_conn(pool) do
+      nil  ->
+        raise "cannot reduce stream outside of transaction"
+      conn ->
+        apply(repo.__sql__, :stream, [conn, statement, params, opts])
+        |> Enumerable.reduce(acc, fun)
     end
   end
 
   @doc false
-  def struct(repo, conn, sql, values, returning, opts) do
+  def into(repo, statement, params, mapper, opts) do
+    {pool, default_opts} = repo.__pool__
+    opts = [decode_mapper: mapper] ++ with_log(repo, params, opts ++ default_opts)
+    case get_conn(pool) do
+      nil  ->
+        raise "cannot collect into stream outside of transaction"
+      conn ->
+        apply(repo.__sql__, :stream, [conn, statement, params, opts])
+        |> Collectable.into()
+    end
+  end
+
+  @doc false
+  def struct(repo, conn, sql, values, on_conflict, returning, opts) do
     case query(repo, sql, values, fn x -> x end, opts) do
       {:ok, %{rows: nil, num_rows: 1}} ->
         {:ok, []}
       {:ok, %{rows: [values], num_rows: 1}} ->
         {:ok, Enum.zip(returning, values)}
       {:ok, %{num_rows: 0}} ->
-        {:error, :stale}
+        if on_conflict == :nothing, do: {:ok, []}, else: {:error, :stale}
       {:error, err} ->
         case conn.to_constraints(err) do
           []          -> raise err
@@ -461,21 +639,19 @@ defmodule Ecto.Adapters.SQL do
 
   defp with_log(repo, params, opts) do
     case Keyword.pop(opts, :log, true) do
-      {true, opts}  -> [log: &log(repo, params, &1)] ++ opts
+      {true, opts}  -> [log: &log(repo, params, &1, opts)] ++ opts
       {false, opts} -> opts
     end
   end
 
-  defp log(repo, params, entry) do
+  defp log(repo, params, entry, opts) do
     %{connection_time: query_time, decode_time: decode_time,
       pool_time: queue_time, result: result, query: query} = entry
-    repo.__log__(%Ecto.LogEntry{query_time: log_time(query_time), decode_time: log_time(decode_time),
-                                queue_time: log_time(queue_time), result: log_result(result),
-                                params: params, query: String.Chars.to_string(query)})
-  end
-
-  defp log_time(time) do
-    time && System.convert_time_unit(time, :native, :micro_seconds)
+    source = Keyword.get(opts, :source)
+    repo.__log__(%Ecto.LogEntry{query_time: query_time, decode_time: decode_time,
+                                queue_time: queue_time, result: log_result(result),
+                                params: params, query: String.Chars.to_string(query),
+                                ansi_color: sql_color(query), source: source})
   end
 
   defp log_result({:ok, _query, res}), do: {:ok, res}
@@ -498,4 +674,14 @@ defmodule Ecto.Adapters.SQL do
   end
 
   defp key(pool), do: {__MODULE__, pool}
+
+  defp sql_color("SELECT" <> _), do: :cyan
+  defp sql_color("ROLLBACK" <> _), do: :red
+  defp sql_color("LOCK" <> _), do: :white
+  defp sql_color("INSERT" <> _), do: :green
+  defp sql_color("UPDATE" <> _), do: :yellow
+  defp sql_color("DELETE" <> _), do: :red
+  defp sql_color("begin" <> _), do: :magenta
+  defp sql_color("commit" <> _), do: :magenta
+  defp sql_color(_), do: nil
 end

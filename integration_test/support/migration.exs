@@ -2,10 +2,10 @@ defmodule Ecto.Integration.Migration do
   use Ecto.Migration
 
   def change do
-    create table(:users) do
-      add :name, :text
+    create table(:users, comment: "users table") do
+      add :name, :text, comment: "name column"
       add :custom_id, :uuid
-      timestamps
+      timestamps()
     end
 
     create table(:posts) do
@@ -15,6 +15,7 @@ defmodule Ecto.Integration.Migration do
       add :bid, :binary_id
       add :uuid, :uuid
       add :meta, :map
+      add :links, {:map, :string}
       add :public, :boolean
       add :cost, :decimal, precision: 2, scale: 1
       add :visits, :integer
@@ -32,13 +33,13 @@ defmodule Ecto.Integration.Migration do
     create table(:posts_users_pk) do
       add :post_id, references(:posts)
       add :user_id, references(:users)
-      timestamps
+      timestamps()
     end
 
     # Add a unique index on uuid. We use this
     # to verify the behaviour that the index
     # only matters if the UUID column is not NULL.
-    create unique_index(:posts, [:uuid])
+    create unique_index(:posts, [:uuid], comment: "posts index")
 
     create table(:permalinks) do
       add :url, :string
@@ -60,6 +61,11 @@ defmodule Ecto.Integration.Migration do
 
     create unique_index(:customs, [:uuid])
 
+    create table(:customs_customs, primary_key: false) do
+      add :custom_id1, references(:customs, column: :bid, type: :binary_id)
+      add :custom_id2, references(:customs, column: :bid, type: :binary_id)
+    end
+
     create table(:barebones) do
       add :num, :integer
     end
@@ -74,6 +80,7 @@ defmodule Ecto.Integration.Migration do
 
     create table(:orders) do
       add :item, :map
+      add :comment_id, references(:comments)
     end
 
     unless :array_type in ExUnit.configuration[:exclude] do
@@ -93,7 +100,9 @@ defmodule Ecto.Integration.Migration do
     create table(:posts_users_composite_pk) do
       add :post_id, references(:posts), primary_key: true
       add :user_id, references(:users), primary_key: true
-      timestamps
+      timestamps()
     end
+
+    create unique_index(:posts_users_composite_pk, [:post_id, :user_id])
   end
 end

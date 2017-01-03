@@ -5,20 +5,25 @@ defmodule Ecto.Repo.Schema do
 
   alias Ecto.Changeset
   alias Ecto.Changeset.Relation
+  require Ecto.Query
 
   @doc """
   Implementation for `Ecto.Repo.insert!/2`.
   """
   def insert_all(repo, adapter, schema, rows, opts) when is_atom(schema) do
-    do_insert_all(repo, adapter, schema,
-                  {schema.__schema__(:prefix), schema.__schema__(:source)}, rows, opts)
+    do_insert_all(repo, adapter, schema, schema.__schema__(:prefix),
+                  schema.__schema__(:source), rows, opts)
   end
 
   def insert_all(repo, adapter, table, rows, opts) when is_binary(table) do
-    do_insert_all(repo, adapter, nil, {nil, table}, rows, opts)
+    do_insert_all(repo, adapter, nil, nil, table, rows, opts)
   end
 
-  defp do_insert_all(_repo, _adapter, _schema, _source, [], opts) do
+  def insert_all(repo, adapter, {source, schema}, rows, opts) when is_atom(schema) do
+    do_insert_all(repo, adapter, schema, schema.__schema__(:prefix), source, rows, opts)
+  end
+
+  defp do_insert_all(_repo, _adapter, _schema, _prefix, _source, [], opts) do
     if opts[:returning] do
       {0, []}
     else
@@ -26,16 +31,19 @@ defmodule Ecto.Repo.Schema do
     end
   end
 
-  defp do_insert_all(repo, adapter, schema, source, rows, opts) when is_list(rows) do
+  defp do_insert_all(repo, adapter, schema, prefix, source, rows, opts) when is_list(rows) do
     returning = opts[:returning] || false
     autogen   = schema && schema.__schema__(:autogenerate_id)
+    source    = {Keyword.get(opts, :prefix, prefix), source}
     fields    = preprocess(returning, schema)
-    metadata  = %{source: source, context: nil, schema: schema, autogenerate_id: autogen}
 
-    {rows, header} =
-      extract_header_and_fields(rows, schema, autogen, adapter)
+    {rows, header} = extract_header_and_fields(rows, schema, autogen, adapter)
+    counter = fn -> Enum.reduce(rows, 0, &length(&1) + &2) end
+    metadata = %{source: source, context: nil, schema: schema, autogenerate_id: autogen}
+    on_conflict = on_conflict(metadata, counter, adapter, opts)
+
     {count, rows} =
-      adapter.insert_all(repo, metadata, Map.keys(header), rows, fields || [], opts)
+      adapter.insert_all(repo, metadata, Map.keys(header), rows, on_conflict, fields || [], opts)
     {count, postprocess(rows, fields, adapter, schema, source)}
   end
 
@@ -75,8 +83,14 @@ defmodule Ecto.Repo.Schema do
   defp init_header({key, _}), do: %{key => true}
 
   defp init_mapper(nil, _adapter) do
-    fn {field, _} = pair, acc ->
-      {pair, Map.put(acc, field, true)}
+    fn {field, value}, acc ->
+      case Ecto.DataType.dump(value) do
+        {:ok, value} ->
+          {{field, value}, Map.put(acc, field, true)}
+        :error ->
+          raise Ecto.ChangeError,
+            message: "value `#{inspect value}` cannot be dumped with Ecto.DataType"
+      end
     end
   end
   defp init_mapper(schema, adapter) do
@@ -149,7 +163,7 @@ defmodule Ecto.Repo.Schema do
   defp do_insert(repo, adapter, %Changeset{valid?: true} = changeset, opts) do
     %{prepare: prepare, types: types} = changeset
     struct = struct_from_changeset!(:insert, changeset)
-    schema  = struct.__struct__
+    schema = struct.__struct__
     fields = schema.__schema__(:fields)
     assocs = schema.__schema__(:associations)
     return = schema.__schema__(:read_after_writes)
@@ -163,24 +177,30 @@ defmodule Ecto.Repo.Schema do
       opts = Keyword.put(opts, :skip_transaction, true)
       user_changeset = run_prepare(changeset, prepare)
 
-      changeset = Ecto.Embedded.prepare(user_changeset, adapter, :insert)
-      {changeset, parents, children} = pop_assocs(changeset, assocs)
+      {changeset, parents, children} = pop_assocs(user_changeset, assocs)
       changeset = process_parents(changeset, parents, opts)
 
-      metadata = metadata(struct)
-      {changes, extra, return} = autogenerate_id(metadata, changeset.changes, return, adapter)
-      {changes, extra} = dump_changes!(:insert, changes, schema, fields, extra, types, adapter)
+      if changeset.valid? do
+        changeset = Ecto.Embedded.prepare(changeset, adapter, :insert)
 
-      args = [repo, metadata, changes, return, opts]
-      case apply(changeset, adapter, :insert, extra, args) do
-        {:ok, values} ->
-          changeset
-          |> load_changes(:loaded, values, adapter)
-          |> process_children(children, user_changeset, opts)
-        {:error, _} = error ->
-          error
-        {:invalid, constraints} ->
-          {:error, constraints_to_errors(user_changeset, :insert, constraints)}
+        metadata = metadata(struct, opts)
+        {changes, extra, return} = autogenerate_id(metadata, changeset.changes, return, adapter)
+        {changes, autogen} = dump_changes!(:insert, Map.take(changes, fields), schema, extra, types, adapter)
+
+        on_conflict = on_conflict(metadata, fn -> length(changes) end, adapter, opts)
+        args = [repo, metadata, changes, on_conflict, return, opts]
+        case apply(changeset, adapter, :insert, args) do
+          {:ok, values} ->
+            changeset
+            |> load_changes(:loaded, values ++ extra, autogen, adapter)
+            |> process_children(children, user_changeset, opts)
+          {:error, _} = error ->
+            error
+          {:invalid, constraints} ->
+            {:error, constraints_to_errors(user_changeset, :insert, constraints)}
+        end
+      else
+        {:error, changeset}
       end
     end)
   end
@@ -205,11 +225,12 @@ defmodule Ecto.Repo.Schema do
   defp do_update(repo, adapter, %Changeset{valid?: true} = changeset, opts) do
     %{prepare: prepare, types: types} = changeset
     struct = struct_from_changeset!(:update, changeset)
-    schema  = struct.__struct__
+    schema = struct.__struct__
     fields = schema.__schema__(:fields)
     assocs = schema.__schema__(:associations)
     return = schema.__schema__(:read_after_writes)
     force? = !!opts[:force]
+    filters = add_pk_filter!(changeset.filters, struct)
 
     # Differently from insert, update does not copy the struct
     # fields into the changeset. All changes must be in the
@@ -221,29 +242,36 @@ defmodule Ecto.Repo.Schema do
         opts = Keyword.put(opts, :skip_transaction, true)
         user_changeset = run_prepare(changeset, prepare)
 
-        changeset = Ecto.Embedded.prepare(user_changeset, adapter, :update)
-        {changeset, parents, children} = pop_assocs(changeset, assocs)
+        {changeset, parents, children} = pop_assocs(user_changeset, assocs)
         changeset = process_parents(changeset, parents, opts)
 
-        changes = changeset.changes
-        {changes, extra} = dump_changes!(:update, changes, schema, fields, [], types, adapter)
+        if changeset.valid? do
+          changeset = Ecto.Embedded.prepare(changeset, adapter, :update)
 
-        filters = add_pk_filter!(changeset.filters, struct)
-        filters = dump_fields!(schema, :update, filters, types, adapter)
+          original =  Map.take(changeset.changes, fields)
+          {changes, autogen} = dump_changes!(:update, original, schema, [], types, adapter)
 
-        # If there are no changes or all the changes were autogenerated but not forced, we skip
-        action = if changes == [] or (changes == extra and not force?), do: :noop, else: :update
-        args   = [repo, metadata(struct), changes, filters, return, opts]
+          filters = dump_fields!(schema, :update, filters, types, adapter)
+          args    = [repo, metadata(struct, opts), changes, filters, return, opts]
 
-        case apply(changeset, adapter, action, extra, args) do
-          {:ok, values} ->
-            changeset
-            |> load_changes(:loaded, values, adapter)
-            |> process_children(children, user_changeset, opts)
-          {:error, _} = error ->
-            error
-          {:invalid, constraints} ->
-            {:error, constraints_to_errors(user_changeset, :update, constraints)}
+          # If there are no changes or all the changes were autogenerated but not forced, we skip
+          {action, autogen} =
+            if original != %{} or (autogen != [] and force?),
+               do: {:update, autogen},
+               else: {:noop, []}
+
+          case apply(changeset, adapter, action, args) do
+            {:ok, values} ->
+              changeset
+              |> load_changes(:loaded, values, autogen, adapter)
+              |> process_children(children, user_changeset, opts)
+            {:error, _} = error ->
+              error
+            {:invalid, constraints} ->
+              {:error, constraints_to_errors(user_changeset, :update, constraints)}
+          end
+        else
+          {:error, changeset}
         end
       end)
     else
@@ -314,10 +342,10 @@ defmodule Ecto.Repo.Schema do
       filters = dump_fields!(schema, :delete, filters, types, adapter)
 
       delete_assocs(changeset, repo, schema, assocs, opts)
-      args = [repo, metadata(struct), filters, opts]
-      case apply(changeset, adapter, :delete, [], args) do
+      args = [repo, metadata(struct, opts), filters, opts]
+      case apply(changeset, adapter, :delete, args) do
         {:ok, values} ->
-          {:ok, load_changes(changeset, :deleted, values, adapter).data}
+          {:ok, load_changes(changeset, :deleted, values, [], adapter).data}
         {:error, _} = error ->
           error
         {:invalid, constraints} ->
@@ -329,6 +357,19 @@ defmodule Ecto.Repo.Schema do
   defp do_delete(repo, _adapter, %Changeset{valid?: false} = changeset, _opts) do
     {:error, put_repo_and_action(changeset, :delete, repo)}
   end
+
+  def load(adapter, schema_or_types, data) do
+    do_load(schema_or_types, data, &Ecto.Type.adapter_load(adapter, &1, &2))
+  end
+
+  defp do_load(schema, data, loader) when is_list(data),
+    do: do_load(schema, Map.new(data), loader)
+  defp do_load(schema, {fields, values}, loader) when is_list(fields) and is_list(values),
+    do: do_load(schema, Enum.zip(fields, values), loader)
+  defp do_load(schema, data, loader) when is_atom(schema),
+    do: Ecto.Schema.__load__(schema, nil, nil, nil, data, loader)
+  defp do_load(types, data, loader) when is_map(types),
+    do: Ecto.Schema.__load__(%{}, types, data, loader)
 
   ## Helpers
 
@@ -353,22 +394,65 @@ defmodule Ecto.Repo.Schema do
     end)
   end
 
-  defp metadata(%{__struct__: schema, __meta__: %{context: context, source: source}}) do
-    %{schema: schema, context: context, source: source,
-      autogenerate_id: schema.__schema__(:autogenerate_id)}
+  defp metadata(%{__struct__: schema, __meta__: %{context: context, source: {prefix, source}}}, opts) do
+    %{autogenerate_id: schema.__schema__(:autogenerate_id),
+      context: context,
+      schema: schema,
+      source: {Keyword.get(opts, :prefix, prefix), source}}
   end
 
-  defp apply(%{valid?: false} = changeset, _adapter, _action, _extra, _args) do
+  defp on_conflict(%{source: {prefix, source}, schema: schema}, changes, adapter, opts) do
+    conflict_target = List.wrap Keyword.get(opts, :conflict_target)
+    case Keyword.get(opts, :on_conflict, :raise) do
+      :raise when conflict_target == [] ->
+        {:raise, [], []}
+      :raise ->
+        raise ArgumentError, ":conflict_target option is forbidden when :on_conflict is :raise"
+      :nothing ->
+        {:nothing, [], conflict_target}
+      :replace_all ->
+        {:replace_all, [], conflict_target}
+      [_ | _] = on_conflict ->
+        from = if schema, do: {source, schema}, else: source
+        query = Ecto.Query.from from, update: ^on_conflict
+        on_conflict_query(query, {source, schema}, prefix, changes, adapter, conflict_target)
+      %Ecto.Query{} = query ->
+        on_conflict_query(query, {source, schema}, prefix, changes, adapter, conflict_target)
+      other ->
+        raise ArgumentError, "unknown value for :on_conflict, got: #{inspect other}"
+    end
+  end
+
+  defp on_conflict_query(query, from, prefix, changes, adapter, conflict_target) do
+    counter = changes.()
+
+    {query, params, _} =
+      %{query | prefix: prefix}
+      |> Ecto.Query.Planner.assert_no_select!(:update_all)
+      |> Ecto.Query.Planner.returning(false)
+      |> Ecto.Query.Planner.prepare(:update_all, adapter, counter)
+
+    unless query.from == from do
+      raise ArgumentError, "cannot run on_conflict: query because the query " <>
+                           "has a different {source, schema} pair than the " <>
+                           "original struct/changeset/query. Got #{inspect query.from} " <>
+                           "and #{inspect from} respectively"
+    end
+
+    {Ecto.Query.Planner.normalize(query, :update_all, adapter, counter),
+     params, conflict_target}
+  end
+
+  defp apply(%{valid?: false} = changeset, _adapter, _action, _args) do
     {:error, changeset}
   end
-  defp apply(_changeset, _adapter, :noop, _extra, _args) do
-    # We ignore extras because they were not persisted
+  defp apply(_changeset, _adapter, :noop, _args) do
     {:ok, []}
   end
-  defp apply(changeset, adapter, action, extra, args) do
+  defp apply(changeset, adapter, action, args) do
     case apply(adapter, action, args) do
       {:ok, values} ->
-        {:ok, extra ++ values}
+        {:ok, values}
       {:invalid, _} = constraints ->
         constraints
       {:error, :stale} ->
@@ -381,7 +465,11 @@ defmodule Ecto.Repo.Schema do
       Enum.map constraints, fn {type, constraint} ->
         user_constraint =
           Enum.find(user_constraints, fn c ->
-            c.type == type and c.constraint == constraint
+            case {c.type, c.constraint,  c.match} do
+              {^type, ^constraint, :exact} -> true
+              {^type, cc, :suffix} -> String.ends_with?(constraint, cc)
+              _ -> false
+            end
           end)
 
         case user_constraint do
@@ -406,14 +494,18 @@ defmodule Ecto.Repo.Schema do
 
           # Handle associations specially
           {_, _, %{^field => {tag, embed_or_assoc}}} when tag in [:assoc, :embed] ->
-            # This is partly reimplemeting the logic behind put_relation
+            # This is partly reimplementing the logic behind put_relation
             # in Ecto.Changeset but we need to do it in a way where we have
             # control over the current value.
             value = Relation.load!(struct, Map.get(struct, field))
-            case Relation.change(embed_or_assoc, value, nil) do
-              {:ok, _, _, true}       -> {changes, errors}
-              {:ok, change, _, false} -> {Map.put(changes, field, change), errors}
-              :error                  -> {changes, [{field, "is invalid"}]}
+            empty = Relation.empty(embed_or_assoc)
+            case Relation.change(embed_or_assoc, value, empty) do
+              {:ok, change, _, false} when change != empty ->
+                {Map.put(changes, field, change), errors}
+              {:ok, _, _, _} ->
+                {changes, errors}
+              :error ->
+                {changes, [{field, "is invalid"}]}
             end
 
           # Struct has a non nil value
@@ -431,16 +523,22 @@ defmodule Ecto.Repo.Schema do
     end
   end
 
-  defp load_changes(%{types: types, changes: changes} = changeset, state, values, adapter) do
+  defp load_changes(%{types: types, changes: changes} = changeset, state, values, autogen, adapter) do
     # It is ok to use types from changeset because we have
     # already filtered the results to be only about fields.
     data =
       changeset.data
-      |> Map.merge(changes)
+      |> merge_changes(changes)
+      |> merge_autogen(autogen)
       |> load_each(values, types, adapter)
     data = put_in(data.__meta__.state, state)
     Map.put(changeset, :data, data)
   end
+
+  defp merge_changes(data, changes),
+    do: Map.merge(data, changes)
+  defp merge_autogen(data, autogen),
+    do: Enum.reduce(autogen, data, fn {k, v}, acc -> Map.put(acc, k, v) end)
 
   defp load_each(struct, kv, types, adapter) do
     Enum.reduce(kv, struct, fn {k, v}, acc ->
@@ -529,7 +627,6 @@ defmodule Ecto.Repo.Schema do
     if Map.has_key?(changes, key) do
       {changes, [], return} # Set by user
     else
-      changes = Map.delete(changes, key)
       if value = adapter.autogenerate(type) do
         {changes, [{key, value}], return} # Autogenerated now
       else
@@ -538,23 +635,23 @@ defmodule Ecto.Repo.Schema do
     end
   end
 
-  defp dump_changes!(action, changes, schema, fields, extra, types, adapter) do
-    changes = Map.take(changes, fields)
-    {leftover, autogen} = autogenerate_changes(schema, action, changes, extra)
-    dumped = dump_fields!(action, schema, leftover, types, adapter)
-    {autogen ++ dumped, autogen}
+  defp dump_changes!(action, changes, schema, extra, types, adapter) do
+    autogen = autogenerate_changes(schema, action, changes)
+    dumped  =
+      dump_fields!(action, schema, changes, types, adapter) ++
+      dump_fields!(action, schema, autogen, types, adapter) ++
+      extra
+    {dumped, autogen}
   end
 
-  defp autogenerate_changes(schema, action, changes, extra) do
-    Enum.reduce schema.__schema__(:autogenerate, action), {changes, extra},
-      fn {k, mod, args}, {acc_changes, acc_autogen} ->
-        if Map.has_key?(acc_changes, k) do
-          {acc_changes, acc_autogen}
-        else
-          {acc_changes, [{k, apply(mod, :autogenerate, args)}|acc_autogen]}
-        end
-      end
+  defp autogenerate_changes(schema, action, changes) do
+    for {k, {mod, fun, args}} <- schema.__schema__(action_to_auto(action)),
+        not Map.has_key?(changes, k),
+        do: {k, apply(mod, fun, args)}
   end
+
+  defp action_to_auto(:insert), do: :autogenerate
+  defp action_to_auto(:update), do: :autoupdate
 
   defp add_pk_filter!(filters, struct) do
     Enum.reduce Ecto.primary_key!(struct), filters, fn

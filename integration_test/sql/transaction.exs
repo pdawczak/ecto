@@ -106,7 +106,7 @@ defmodule Ecto.Integration.TransactionTest do
         UniqueError -> :ok
       end
 
-      assert_raise DBConnection.Error, "transaction rolling back",
+      assert_raise DBConnection.ConnectionError, "transaction rolling back",
         fn() -> PoolRepo.insert!(%Trans{text: "5"}) end
     end) == {:error, :rollback}
 
@@ -131,7 +131,7 @@ defmodule Ecto.Integration.TransactionTest do
       assert {:error, :oops} = PoolRepo.transaction(fn ->
         PoolRepo.rollback(:oops)
       end)
-      assert_raise DBConnection.Error, "transaction rolling back",
+      assert_raise DBConnection.ConnectionError, "transaction rolling back",
         fn() -> PoolRepo.insert!(%Trans{text: "5"}) end
     end) == {:error, :rollback}
 
@@ -139,7 +139,7 @@ defmodule Ecto.Integration.TransactionTest do
   end
 
   test "transactions are not shared in repo" do
-    pid = self
+    pid = self()
 
     new_pid = spawn_link fn ->
       PoolRepo.transaction(fn ->
@@ -221,7 +221,7 @@ defmodule Ecto.Integration.TransactionTest do
     end
 
     # If it doesn't fail, the transaction was not closed properly.
-    catch_error(Ecto.Adapters.SQL.query!(PoolRepo, "savepoint foobar", []))
+    catch_error(PoolRepo.query!("savepoint foobar"))
   end
 
   test "log raises after begin, drops the whole transaction" do

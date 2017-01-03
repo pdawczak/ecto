@@ -2,10 +2,14 @@ defmodule Mix.Tasks.Ecto.Drop do
   use Mix.Task
   import Mix.Ecto
 
-  @shortdoc "Drop the storage for the repo"
+  @shortdoc "Drops the repository storage"
+  @recursive true
 
   @moduledoc """
-  Drop the storage for the repository.
+  Drop the storage for the given repository.
+
+  The repository must be set under `:ecto_repos` in the
+  current app configuration or given via the `-r` option.
 
   ## Examples
 
@@ -14,7 +18,7 @@ defmodule Mix.Tasks.Ecto.Drop do
 
   ## Command line options
 
-    * `-r`, `--repo` - the repo to drop (defaults to `YourApp.Repo`)
+    * `-r`, `--repo` - the repo to drop
     * `--no-compile` - do not compile before stopping
 
   """
@@ -34,8 +38,6 @@ defmodule Mix.Tasks.Ecto.Drop do
         drop_database(repo, opts)
       end
     end
-
-    Mix.Task.reenable "ecto.drop"
   end
 
   defp skip_safety_warnings? do
@@ -43,19 +45,19 @@ defmodule Mix.Tasks.Ecto.Drop do
   end
 
   defp drop_database(repo, opts) do
-    case Ecto.Storage.down(repo) do
+    case repo.__adapter__.storage_down(repo.config) do
       :ok ->
         unless opts[:quiet] do
-          Mix.shell.info "The database for #{inspect repo} has been dropped."
+          Mix.shell.info "The database for #{inspect repo} has been dropped"
         end
       {:error, :already_down} ->
         unless opts[:quiet] do
-          Mix.shell.info "The database for #{inspect repo} has already been dropped."
+          Mix.shell.info "The database for #{inspect repo} has already been dropped"
         end
       {:error, term} when is_binary(term) ->
-        Mix.raise "The database for #{inspect repo} couldn't be dropped, reason given: #{term}."
+        Mix.raise "The database for #{inspect repo} couldn't be dropped: #{term}"
       {:error, term} ->
-        Mix.raise "The database for #{inspect repo} couldn't be dropped, reason given: #{inspect term}."
+        Mix.raise "The database for #{inspect repo} couldn't be dropped: #{inspect term}"
     end
   end
 end

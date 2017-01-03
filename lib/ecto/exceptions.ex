@@ -5,6 +5,20 @@ defmodule Ecto.Query.CompileError do
   defexception [:message]
 end
 
+defmodule Ecto.Query.CastError do
+  @moduledoc """
+  Raised at runtime when a value cannot be cast.
+  """
+  defexception [:type, :value, :message]
+
+  def exception(opts) do
+    value = Keyword.fetch!(opts, :value)
+    type  = Keyword.fetch!(opts, :type)
+    msg   = Keyword.fetch!(opts, :message)
+    %__MODULE__{value: value, type: type, message: msg}
+  end
+end
+
 defmodule Ecto.QueryError do
   @moduledoc """
   Raised at runtime when the query is invalid.
@@ -67,38 +81,57 @@ defmodule Ecto.InvalidChangesetError do
   defexception [:action, :changeset]
 
   def message(%{action: action, changeset: changeset}) do
+    changes = extract_changes(changeset)
+    errors = Ecto.Changeset.traverse_errors(changeset, & &1)
+
     """
     could not perform #{action} because changeset is invalid.
 
-    * Changeset changes
+    Applied changes
 
-    #{inspect changeset.changes}
+    #{pretty changes}
 
-    * Changeset params
+    Params
 
-    #{inspect changeset.params}
+    #{pretty changeset.params}
 
-    * Changeset errors
+    Errors
 
-    #{inspect changeset.errors}
+    #{pretty errors}
+
+    Changeset
+
+    #{pretty changeset}
     """
   end
+
+  defp pretty(term) do
+    inspect(term, pretty: true)
+    |> String.split("\n")
+    |> Enum.map_join("\n", &"    " <> &1)
+  end
+
+  defp extract_changes(%Ecto.Changeset{changes: changes}) do
+    Enum.reduce(changes, %{}, fn({key, value}, acc) ->
+      case value do
+        %Ecto.Changeset{action: :delete} -> acc
+        _ -> Map.put(acc, key, extract_changes(value))
+      end
+    end)
+  end
+  defp extract_changes([%Ecto.Changeset{action: :delete} | tail]),
+    do: extract_changes(tail)
+  defp extract_changes([%Ecto.Changeset{} = changeset | tail]),
+    do: [extract_changes(changeset) | extract_changes(tail)]
+  defp extract_changes(other),
+    do: other
 end
 
 defmodule Ecto.CastError do
   @moduledoc """
-  Raised at runtime when a value cannot be cast.
+  Raised when a changeset can't cast a value.
   """
-  defexception [:schema, :field, :type, :value, :message]
-
-  def exception(opts) do
-    schema = Keyword.get(opts, :schema)
-    field  = Keyword.get(opts, :field)
-    value  = Keyword.fetch!(opts, :value)
-    type   = Keyword.fetch!(opts, :type)
-    msg    = Keyword.fetch!(opts, :message)
-    %__MODULE__{schema: schema, field: field, value: value, type: type, message: msg}
-  end
+  defexception [:message]
 end
 
 defmodule Ecto.InvalidURLError do

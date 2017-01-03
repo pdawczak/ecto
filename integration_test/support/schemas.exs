@@ -8,6 +8,7 @@ defmodule Ecto.Integration.Schema do
         raise ":primary_key_type not set in :ecto application"
       @primary_key {:id, type, autogenerate: true}
       @foreign_key_type type
+      @timestamps_opts [usec: false]
     end
   end
 end
@@ -38,21 +39,27 @@ defmodule Ecto.Integration.Post do
     field :bid, :binary_id
     field :uuid, Ecto.UUID, autogenerate: true
     field :meta, :map
-    field :posted, Ecto.Date
+    field :links, {:map, :string}
+    field :posted, :date
     has_many :comments, Ecto.Integration.Comment, on_delete: :delete_all, on_replace: :delete
     has_one :permalink, Ecto.Integration.Permalink, on_delete: :delete_all, on_replace: :delete
     has_many :comments_authors, through: [:comments, :author]
     belongs_to :author, Ecto.Integration.User
     many_to_many :users, Ecto.Integration.User,
       join_through: "posts_users", on_delete: :delete_all, on_replace: :delete
+    many_to_many :unique_users, Ecto.Integration.User,
+      join_through: "posts_users", unique: true
+    many_to_many :constraint_users, Ecto.Integration.User,
+      join_through: Ecto.Integration.PostUserCompositePk
     has_many :users_comments, through: [:users, :comments]
     has_many :comments_authors_permalinks, through: [:comments_authors, :permalink]
-    timestamps
+    timestamps()
+    has_one :post_user_composite_pk, Ecto.Integration.PostUserCompositePk
   end
 
-  def changeset(model, params) do
-    cast(model, params, [], ~w(counter title text temp public cost visits
-                               intensity bid uuid meta posted))
+  def changeset(schema, params) do
+    cast(schema, params, ~w(counter title text temp public cost visits
+                           intensity bid uuid meta posted))
   end
 end
 
@@ -89,6 +96,10 @@ defmodule Ecto.Integration.Comment do
     belongs_to :author, Ecto.Integration.User
     has_one :post_permalink, through: [:post, :permalink]
   end
+
+  def changeset(schema, params) do
+    Ecto.Changeset.cast(schema, params, [:text])
+  end
 end
 
 defmodule Ecto.Integration.Permalink do
@@ -121,7 +132,7 @@ defmodule Ecto.Integration.PostUser do
   schema "posts_users_pk" do
     belongs_to :user, Ecto.Integration.User
     belongs_to :post, Ecto.Integration.Post
-    timestamps
+    timestamps()
   end
 end
 
@@ -129,7 +140,7 @@ defmodule Ecto.Integration.User do
   @moduledoc """
   This module is used to test:
 
-    * Timestamps
+    * UTC Timestamps
     * Relationships
     * Dependent callbacks
 
@@ -143,7 +154,8 @@ defmodule Ecto.Integration.User do
     has_many :posts, Ecto.Integration.Post, foreign_key: :author_id, on_delete: :nothing, on_replace: :delete
     belongs_to :custom, Ecto.Integration.Custom, references: :bid, type: :binary_id
     many_to_many :schema_posts, Ecto.Integration.Post, join_through: Ecto.Integration.PostUser
-    timestamps
+    many_to_many :unique_posts, Ecto.Integration.Post, join_through: Ecto.Integration.PostUserCompositePk
+    timestamps(type: :utc_datetime)
   end
 end
 
@@ -152,7 +164,7 @@ defmodule Ecto.Integration.Custom do
   This module is used to test:
 
     * binary_id primary key
-    * Tying another schemas to an existing model
+    * Tying another schemas to an existing schema
 
   Due to the second item, it must be a subset of posts.
   """
@@ -161,6 +173,9 @@ defmodule Ecto.Integration.Custom do
   @primary_key {:bid, :binary_id, autogenerate: true}
   schema "customs" do
     field :uuid, Ecto.UUID
+    many_to_many :customs, Ecto.Integration.Custom,
+      join_through: "customs_customs", join_keys: [custom_id1: :bid, custom_id2: :bid],
+      on_delete: :delete_all, on_replace: :delete
   end
 end
 
@@ -168,7 +183,7 @@ defmodule Ecto.Integration.Barebone do
   @moduledoc """
   This module is used to test:
 
-    * A model wthout primary keys
+    * A schema without primary keys
 
   """
   use Ecto.Integration.Schema
@@ -184,7 +199,7 @@ defmodule Ecto.Integration.Tag do
   This module is used to test:
 
     * The array type
-    * Embedding many models (uses array)
+    * Embedding many schemas (uses array)
 
   """
   use Ecto.Integration.Schema
@@ -203,11 +218,11 @@ defmodule Ecto.Integration.Item do
     * Embedding
 
   """
-  use Ecto.Integration.Schema
+  use Ecto.Schema
 
   embedded_schema do
     field :price, :integer
-    field :valid_at, Ecto.Date
+    field :valid_at, :date
   end
 end
 
@@ -215,7 +230,7 @@ defmodule Ecto.Integration.Order do
   @moduledoc """
   This module is used to test:
 
-    * Embedding one model
+    * Embedding one schema
 
   """
   use Ecto.Integration.Schema
@@ -255,6 +270,6 @@ defmodule Ecto.Integration.PostUserCompositePk do
   schema "posts_users_composite_pk" do
     belongs_to :user, Ecto.Integration.User, primary_key: true
     belongs_to :post, Ecto.Integration.Post, primary_key: true
-    timestamps
+    timestamps()
   end
 end

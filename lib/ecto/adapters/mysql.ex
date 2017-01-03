@@ -10,7 +10,9 @@ defmodule Ecto.Adapters.MySQL do
 
   MySQL options split in different categories described
   below. All options should be given via the repository
-  configuration.
+  configuration. These options are also passed to the module
+  specified in the `:pool` option, so check that module's
+  documentation for more options.
 
   ### Compile time options
 
@@ -18,7 +20,7 @@ defmodule Ecto.Adapters.MySQL do
   recompilation in order to make an effect.
 
     * `:adapter` - The adapter name, in this case, `Ecto.Adapters.MySQL`
-    * `:pool` - The connection pool module, defaults to `Ecto.Pools.Poolboy`
+    * `:pool` - The connection pool module, defaults to `DBConnection.Poolboy`
     * `:pool_timeout` - The default timeout to use on pool calls, defaults to `5000`
     * `:timeout` - The default timeout to use on queries, defaults to `15000`
 
@@ -28,16 +30,30 @@ defmodule Ecto.Adapters.MySQL do
     * `:port` - Server port (default: 3306)
     * `:username` - Username
     * `:password` - User password
-    * `:parameters` - Keyword list of connection parameters
     * `:ssl` - Set to true if ssl should be used (default: false)
-    * `:ssl_opts` - A list of ssl options, see ssl docs
-    * `:connect_timeout` - The timeout in miliseconds for establishing new connections (default: 5000)
-    * `:after_connect` - A `{mod, fun, args}` to be invoked after a connection is established
+    * `:ssl_opts` - A list of ssl options, see Erlang's `ssl` docs
+    * `:parameters` - Keyword list of connection parameters
+    * `:connect_timeout` - The timeout for establishing new connections (default: 5000)
+    * `:socket_options` - Specifies socket configuration
+
+  The `:socket_options` are particularly useful when configuring the size
+  of both send and receive buffers. For example, when Ecto starts with a
+  pool of 20 connections, the memory usage may quickly grow from 20MB to
+  50MB based on the operating system default values for TCP buffers. It is
+  advised to stick with the operating system defaults but they can be
+  tweaked if desired:
+
+      socket_options: [recbuf: 8192, sndbuf: 8192]
+
+  We also recommend developers to consult the
+  [Mariaex documentation](https://hexdocs.pm/mariaex/Mariaex.html#start_link/1)
+  for a complete listing of all supported options.
 
   ### Storage options
 
     * `:charset` - the database encoding (default: "utf8")
     * `:collation` - the collation order
+    * `:dump_path` - where to place dumped structures
 
   ## Limitations
 
@@ -86,16 +102,20 @@ defmodule Ecto.Adapters.MySQL do
 
   # And provide a custom storage implementation
   @behaviour Ecto.Adapter.Storage
+  @behaviour Ecto.Adapter.Structure
 
   ## Custom MySQL types
 
-  def loaders(:map, type), do: [&json_decode/1, type]
-  def loaders(:boolean, type), do: [&bool_decode/1, type]
-  def loaders(:binary_id, type), do: [Ecto.UUID, type]
-  def loaders({:embed, _} = type, _),
-    do: [&json_decode/1, &Ecto.Adapters.SQL.load_embed(type, &1)]
-  def loaders(_primitive, type), do: [type]
+  @doc false
+  def loaders(:map, type),            do: [&json_decode/1, type]
+  def loaders({:map, _}, type),       do: [&json_decode/1, type]
+  def loaders(:boolean, type),        do: [&bool_decode/1, type]
+  def loaders(:binary_id, type),      do: [Ecto.UUID, type]
+  def loaders({:embed, _} = type, _), do: [&json_decode/1, &Ecto.Adapters.SQL.load_embed(type, &1)]
+  def loaders(_, type),               do: [type]
 
+  defp bool_decode(<<0>>), do: {:ok, false}
+  defp bool_decode(<<1>>), do: {:ok, true}
   defp bool_decode(0), do: {:ok, false}
   defp bool_decode(1), do: {:ok, true}
   defp bool_decode(x), do: {:ok, x}
@@ -109,8 +129,8 @@ defmodule Ecto.Adapters.MySQL do
 
   @doc false
   def storage_up(opts) do
-    database  = Keyword.fetch!(opts, :database)
-    charset   = opts[:charset] || "utf8"
+    database = Keyword.fetch!(opts, :database) || raise ":database is nil in repository configuration"
+    charset  = opts[:charset] || "utf8"
 
     command =
       ~s(CREATE DATABASE `#{database}` DEFAULT CHARACTER SET = #{charset})
@@ -130,7 +150,8 @@ defmodule Ecto.Adapters.MySQL do
 
   @doc false
   def storage_down(opts) do
-    {output, status} = run_with_mysql("DROP DATABASE `#{opts[:database]}`", opts)
+    database = Keyword.fetch!(opts, :database) || raise ":database is nil in repository configuration"
+    {output, status} = run_with_mysql("DROP DATABASE `#{database}`", opts)
 
     cond do
       status == 0                               -> :ok
@@ -139,23 +160,9 @@ defmodule Ecto.Adapters.MySQL do
     end
   end
 
-  defp run_with_mysql(sql_command, database) do
-    unless System.find_executable("mysql") do
-      raise "could not find executable `mysql` in path, " <>
-            "please guarantee it is available before running ecto commands"
-    end
-
-    env =
-      if password = database[:password] do
-        [{"MYSQL_PWD", password}]
-      else
-        []
-      end
-
-    host = database[:hostname] || System.get_env("MYSQL_HOST") || "localhost"
-    port = database[:port] || System.get_env("MYSQL_TCP_PORT") || "3306"
-    args = ["--silent", "-u", database[:username], "-h", host, "-P", to_string(port), "-e", sql_command]
-    System.cmd("mysql", args, env: env, stderr_to_stdout: true)
+  defp run_with_mysql(sql_command, opts) do
+    args = ["--silent", "--execute", sql_command]
+    run_with_cmd("mysql", opts, args)
   end
 
   @doc false
@@ -164,12 +171,16 @@ defmodule Ecto.Adapters.MySQL do
   end
 
   @doc false
-  def insert(repo, %{source: {prefix, source}, autogenerate_id: {key, :id}}, params, [key], opts) do
+  def insert(repo, %{source: {prefix, source}} = meta, params,
+             {_, query_params, _} = on_conflict, returning, opts) do
+    key = primary_key!(meta, returning)
     {fields, values} = :lists.unzip(params)
-    sql = @conn.insert(prefix, source, fields, [fields], [])
-    case Ecto.Adapters.SQL.query(repo, sql, values, opts) do
+    sql = @conn.insert(prefix, source, fields, [fields], on_conflict, [])
+    case Ecto.Adapters.SQL.query(repo, sql, values ++ query_params, opts) do
       {:ok, %{num_rows: 1, last_insert_id: last_insert_id}} ->
-        {:ok, [{key, last_insert_id}]}
+        {:ok, last_insert_id(key, last_insert_id)}
+      {:ok, %{num_rows: 2, last_insert_id: last_insert_id}} ->
+        {:ok, last_insert_id(key, last_insert_id)}
       {:error, err} ->
         case @conn.to_constraints(err) do
           []          -> raise err
@@ -178,12 +189,124 @@ defmodule Ecto.Adapters.MySQL do
     end
   end
 
-  def insert(repo, schema_meta, params, [], opts) do
-    super(repo, schema_meta, params, [], opts)
-  end
-
-  def insert(_repo, %{schema: schema}, _params, returning, _opts) do
+  defp primary_key!(%{autogenerate_id: {key, :id}}, [key]), do: key
+  defp primary_key!(_, []), do: nil
+  defp primary_key!(%{schema: schema}, returning) do
     raise ArgumentError, "MySQL does not support :read_after_writes in schemas for non-primary keys. " <>
                          "The following fields in #{inspect schema} are tagged as such: #{inspect returning}"
+  end
+
+  defp last_insert_id(nil, _last_insert_id), do: []
+  defp last_insert_id(_key, 0), do: []
+  defp last_insert_id(key, last_insert_id), do: [{key, last_insert_id}]
+
+  @doc false
+  def structure_dump(default, config) do
+    table = config[:migration_source] || "schema_migrations"
+    path  = config[:dump_path] || Path.join(default, "structure.sql")
+
+    with {:ok, versions} <- select_versions(table, config),
+         {:ok, contents} <- mysql_dump(config),
+         {:ok, contents} <- append_versions(table, versions, contents) do
+      File.mkdir_p!(Path.dirname(path))
+      File.write!(path, contents)
+      {:ok, path}
+    end
+  end
+
+  defp select_versions(table, config) do
+    case run_query(~s[SELECT version FROM `#{table}` ORDER BY version], config) do
+      {:ok, %{rows: rows}} -> {:ok, Enum.map(rows, &hd/1)}
+      {:error, %{mariadb: %{code: 1146}}} -> {:ok, []}
+      {:error, _} = error -> error
+    end
+  end
+
+  defp mysql_dump(config) do
+    case run_with_cmd("mysqldump", config, ["--no-data", "--routines", config[:database]]) do
+      {output, 0} -> {:ok, output}
+      {output, _} -> {:error, output}
+    end
+  end
+
+  defp append_versions(_table, [], contents) do
+    {:ok, contents}
+  end
+  defp append_versions(table, versions, contents) do
+    {:ok,
+      contents <>
+      ~s[INSERT INTO `#{table}` (version) VALUES ] <>
+      Enum.map_join(versions, ", ", &"(#{&1})") <>
+      ~s[;\n\n]}
+  end
+
+  @doc false
+  def structure_load(default, config) do
+    path = config[:dump_path] || Path.join(default, "structure.sql")
+
+    args = [
+      "--execute", "SET FOREIGN_KEY_CHECKS = 0; SOURCE #{path}; SET FOREIGN_KEY_CHECKS = 1",
+      "--database", config[:database]
+    ]
+
+    case run_with_cmd("mysql", config, args) do
+      {_output, 0} -> {:ok, path}
+      {output, _}  -> {:error, output}
+    end
+  end
+
+  defp run_query(sql, opts) do
+    {:ok, _} = Application.ensure_all_started(:mariaex)
+
+    opts =
+      opts
+      |> Keyword.delete(:name)
+      |> Keyword.put(:pool, DBConnection.Connection)
+      |> Keyword.put(:backoff_type, :stop)
+
+    {:ok, pid} = Task.Supervisor.start_link
+
+    task = Task.Supervisor.async_nolink(pid, fn ->
+      {:ok, conn} = Mariaex.start_link(opts)
+
+      value = Ecto.Adapters.MySQL.Connection.execute(conn, sql, [], opts)
+      GenServer.stop(conn)
+      value
+    end)
+
+    timeout = Keyword.get(opts, :timeout, 15_000)
+
+    case Task.yield(task, timeout) || Task.shutdown(task) do
+      {:ok, {:ok, result}} ->
+        {:ok, result}
+      {:ok, {:error, error}} ->
+        {:error, error}
+      {:exit, {%{__struct__: struct} = error, _}}
+          when struct in [Mariaex.Error, DBConnection.Error] ->
+        {:error, error}
+      {:exit, reason}  ->
+        {:error, RuntimeError.exception(Exception.format_exit(reason))}
+      nil ->
+        {:error, RuntimeError.exception("command timed out")}
+    end
+  end
+
+  defp run_with_cmd(cmd, opts, opt_args) do
+    unless System.find_executable(cmd) do
+      raise "could not find executable `#{cmd}` in path, " <>
+            "please guarantee it is available before running ecto commands"
+    end
+
+    env =
+      if password = opts[:password] do
+        [{"MYSQL_PWD", password}]
+      else
+        []
+      end
+
+    host = opts[:hostname] || System.get_env("MYSQL_HOST") || "localhost"
+    port = opts[:port] || System.get_env("MYSQL_TCP_PORT") || "3306"
+    args = ["--user", opts[:username], "--host", host, "--port", to_string(port), "--protocol=tcp"] ++ opt_args
+    System.cmd(cmd, args, env: env, stderr_to_stdout: true)
   end
 end

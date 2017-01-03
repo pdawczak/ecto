@@ -3,12 +3,13 @@ Logger.configure(level: :info)
 # :uses_usec, :uses_msec and :modify_column are supported
 # on MySQL 5.6 but that is not yet supported in travis.
 ExUnit.start exclude: [:array_type, :read_after_writes, :uses_usec, :uses_msec, :returning,
-                       :strict_savepoint, :create_index_if_not_exists, :modify_column, :rename_column],
-             max_cases: 1
+                       :strict_savepoint, :create_index_if_not_exists, :modify_column,
+                       :transaction_isolation, :rename_column, :with_conflict_target]
 
 # Configure Ecto for support and tests
 Application.put_env(:ecto, :lock_for_update, "FOR UPDATE")
 Application.put_env(:ecto, :primary_key_type, :id)
+Application.put_env(:ecto, :async_integration_tests, false)
 
 # Configure MySQL connection
 Application.put_env(:ecto, :mysql_test_url,
@@ -22,8 +23,8 @@ Code.require_file "../support/migration.exs", __DIR__
 
 pool =
   case System.get_env("ECTO_POOL") || "poolboy" do
-    "poolboy"        -> DBConnection.Poolboy
-    "sojourn_broker" -> DBConnection.Sojourn
+    "poolboy" -> DBConnection.Poolboy
+    "sbroker" -> DBConnection.Sojourn
   end
 
 # Pool repo for async, safe tests
@@ -68,11 +69,11 @@ defmodule Ecto.Integration.Case do
   end
 end
 
-{:ok, _} = Application.ensure_all_started(:mariaex)
+{:ok, _} = Ecto.Adapters.MySQL.ensure_all_started(TestRepo, :temporary)
 
 # Load up the repository, start it, and run migrations
-_   = Ecto.Storage.down(TestRepo)
-:ok = Ecto.Storage.up(TestRepo)
+_   = Ecto.Adapters.MySQL.storage_down(TestRepo.config)
+:ok = Ecto.Adapters.MySQL.storage_up(TestRepo.config)
 
 {:ok, _pid} = TestRepo.start_link
 {:ok, _pid} = PoolRepo.start_link

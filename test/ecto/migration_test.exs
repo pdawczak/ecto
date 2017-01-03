@@ -13,7 +13,7 @@ defmodule Ecto.MigrationTest do
   setup meta do
     {:ok, runner} =
       Runner.start_link(self(), TestRepo, meta[:direction] || :forward, :up, false)
-    Process.put(:ecto_migration, %{runner: runner, prefix: meta[:prefix]})
+    Runner.metadata(runner, meta)
     {:ok, runner: runner}
   end
 
@@ -25,14 +25,21 @@ defmodule Ecto.MigrationTest do
     assert direction() == :up
   end
 
+  @tag prefix: "foo"
+  test "allows prefix to be retrieved" do
+    assert prefix() == "foo"
+  end
+
   test "creates a table" do
     assert table(:posts) == %Table{name: :posts, primary_key: true}
     assert table(:posts, primary_key: false) == %Table{name: :posts, primary_key: false}
-    assert table(:posts, prefix: :foo) == %Table{name: :posts, primary_key: true, prefix: :foo}
+    assert table(:posts, prefix: "foo") == %Table{name: :posts, primary_key: true, prefix: "foo"}
   end
 
   test "creates an index" do
     assert index(:posts, [:title]) ==
+           %Index{table: :posts, unique: false, name: :posts_title_index, columns: [:title]}
+    assert index(:posts, :title) ==
            %Index{table: :posts, unique: false, name: :posts_title_index, columns: [:title]}
     assert index(:posts, ["lower(title)"]) ==
            %Index{table: :posts, unique: false, name: :posts_lower_title_index, columns: ["lower(title)"]}
@@ -40,11 +47,13 @@ defmodule Ecto.MigrationTest do
            %Index{table: :posts, unique: true, name: :foo, columns: [:title]}
     assert unique_index(:posts, [:title], name: :foo) ==
            %Index{table: :posts, unique: true, name: :foo, columns: [:title]}
+    assert unique_index(:posts, :title, name: :foo) ==
+           %Index{table: :posts, unique: true, name: :foo, columns: [:title]}
   end
 
   test "creates a reference" do
     assert references(:posts) ==
-           %Reference{table: :posts, column: :id, type: :serial}
+           %Reference{table: :posts, column: :id, type: :bigserial}
     assert references(:posts, type: :uuid, column: :other) ==
            %Reference{table: :posts, column: :other, type: :uuid}
   end
@@ -67,7 +76,7 @@ defmodule Ecto.MigrationTest do
     execute "TEST"
     commands = Agent.get(runner, & &1.commands)
     assert commands == ["TEST"]
-    flush
+    flush()
     commands = Agent.get(runner, & &1.commands)
     assert commands == []
   end
@@ -77,13 +86,13 @@ defmodule Ecto.MigrationTest do
 
   test "forward: executes the given SQL" do
     execute "HELLO, IS IT ME YOU ARE LOOKING FOR?"
-    flush
+    flush()
     assert last_command() == "HELLO, IS IT ME YOU ARE LOOKING FOR?"
   end
 
   test "forward: executes given keyword command" do
     execute create: "posts", capped: true, size: 1024
-    flush
+    flush()
     assert last_command() == [create: "posts", capped: true, size: 1024]
   end
 
@@ -91,38 +100,75 @@ defmodule Ecto.MigrationTest do
     result = create(table = table(:posts)) do
       add :title, :string
       add :cost, :decimal, precision: 3
+      add :likes, :"int UNSIGNED", default: 0
       add :author_id, references(:authors)
-      timestamps
+      timestamps()
     end
-    flush
+    flush()
 
     assert last_command() ==
            {:create, table,
-              [{:add, :id, :serial, [primary_key: true]},
+              [{:add, :id, :bigserial, [primary_key: true]},
                {:add, :title, :string, []},
                {:add, :cost, :decimal, [precision: 3]},
+               {:add, :likes, :"int UNSIGNED", [default: 0]},
                {:add, :author_id, %Reference{table: :authors}, []},
-               {:add, :inserted_at, :datetime, [null: false]},
-               {:add, :updated_at, :datetime, [null: false]}]}
+               {:add, :inserted_at, :naive_datetime, [null: false]},
+               {:add, :updated_at, :naive_datetime, [null: false]}]}
 
     assert result == table(:posts)
 
     create table = table(:posts, primary_key: false, timestamps: false) do
       add :title, :string
     end
-    flush
+    flush()
 
     assert last_command() ==
            {:create, table,
               [{:add, :title, :string, []}]}
   end
 
-  test "forward: creates an empty table" do
-    create table = table(:posts)
-    flush
+  test "forward: creates a table without updated_at timestamp" do
+    create table = table(:posts, primary_key: false) do
+      timestamps(inserted_at: :created_at, updated_at: false)
+    end
+    flush()
 
     assert last_command() ==
-           {:create, table, [{:add, :id, :serial, [primary_key: true]}]}
+           {:create, table,
+              [{:add, :created_at, :naive_datetime, [null: false]}]}
+  end
+
+  test "forward: creates a table with timestamps of type date" do
+    create table = table(:posts, primary_key: false) do
+      timestamps(inserted_at: :inserted_on, updated_at: :updated_on, type: :date)
+    end
+    flush()
+
+    assert last_command() ==
+           {:create, table,
+              [{:add, :inserted_on, :date, [null: false]},
+               {:add, :updated_on, :date, [null: false]}]}
+  end
+
+  test "forward: creates a table with timestamps of database specific type" do
+    create table = table(:posts, primary_key: false) do
+      timestamps(type: :"datetime(6)")
+    end
+    flush()
+
+    assert last_command() ==
+           {:create, table,
+              [{:add, :inserted_at, :"datetime(6)", [null: false]},
+               {:add, :updated_at, :"datetime(6)", [null: false]}]}
+  end
+
+  test "forward: creates an empty table" do
+    create table = table(:posts)
+    flush()
+
+    assert last_command() ==
+           {:create, table, [{:add, :id, :bigserial, [primary_key: true]}]}
   end
 
   test "forward: alters a table" do
@@ -131,7 +177,7 @@ defmodule Ecto.MigrationTest do
       modify :title, :text
       remove :views
     end
-    flush
+    flush()
 
     assert last_command() ==
            {:alter, %Table{name: :posts},
@@ -142,7 +188,7 @@ defmodule Ecto.MigrationTest do
 
   test "forward: rename column" do
     result = rename(table(:posts), :given_name, to: :first_name)
-    flush
+    flush()
 
     assert last_command() == {:rename, %Table{name: :posts}, :given_name, :first_name}
     assert result == table(:posts)
@@ -150,56 +196,56 @@ defmodule Ecto.MigrationTest do
 
   test "forward: drops a table" do
     result = drop table(:posts)
-    flush
+    flush()
     assert {:drop, %Table{}} = last_command()
     assert result == table(:posts)
   end
 
   test "forward: creates an index" do
     create index(:posts, [:title])
-    flush
+    flush()
     assert {:create, %Index{}} = last_command()
   end
 
   test "forward: creates a check constraint" do
     create constraint(:posts, :price, check: "price > 0")
-    flush
+    flush()
     assert {:create, %Constraint{}} = last_command()
   end
 
-  test "forward: creates an exclude constraint" do
+  test "forward: creates an exclusion constraint" do
     create constraint(:posts, :price, exclude: "price")
-    flush
+    flush()
     assert {:create, %Constraint{}} = last_command()
   end
 
   test "forward: raises on invalid constraints" do
     assert_raise ArgumentError, "a constraint must have either a check or exclude option", fn ->
       create constraint(:posts, :price)
-      flush
+      flush()
     end
 
     assert_raise ArgumentError, "a constraint must not have both check and exclude options", fn ->
       create constraint(:posts, :price, check: "price > 0", exclude: "price")
-      flush
+      flush()
     end
   end
 
   test "forward: drops an index" do
     drop index(:posts, [:title])
-    flush
+    flush()
     assert {:drop, %Index{}} = last_command()
   end
 
   test "forward: drops a constraint" do
     drop constraint(:posts, :price)
-    flush
+    flush()
     assert {:drop, %Constraint{}} = last_command()
   end
 
   test "forward: renames a table" do
     result = rename(table(:posts), to: table(:new_posts))
-    flush
+    flush()
     assert {:rename, %Table{name: :posts}, %Table{name: :new_posts}} = last_command()
     assert result == table(:new_posts)
   end
@@ -207,27 +253,35 @@ defmodule Ecto.MigrationTest do
   # prefix
 
   test "forward: creates a table with prefix from migration" do
-    create(table(:posts, prefix: :foo))
-    flush
+    create(table(:posts, prefix: "foo"))
+    flush()
 
     {_, table, _} = last_command()
-
-    assert table.prefix == :foo
+    assert table.prefix == "foo"
   end
 
-  @tag prefix: :foo
+  @tag prefix: "foo"
   test "forward: creates a table with prefix from manager" do
     create(table(:posts))
-    flush
+    flush()
 
     {_, table, _} = last_command()
-    assert table.prefix == :foo
+    assert table.prefix == "foo"
   end
 
   @tag prefix: :foo
-  test "forward: creates a table with prefix from manager matching prefix from migration" do
+  test "forward: creates a table with prefix from manager matching atom prefix" do
+    create(table(:posts, prefix: "foo"))
+    flush()
+
+    {_, table, _} = last_command()
+    assert table.prefix == "foo"
+  end
+
+  @tag prefix: "foo"
+  test "forward: creates a table with prefix from manager matching string prefix" do
     create(table(:posts, prefix: :foo))
-    flush
+    flush()
 
     {_, table, _} = last_command()
     assert table.prefix == :foo
@@ -236,74 +290,74 @@ defmodule Ecto.MigrationTest do
   @tag prefix: :bar
   test "forward: raise error when prefixes don't match" do
     assert_raise Ecto.MigrationError,
-                 "the :prefix option `:foo` does match the migrator prefix `:bar`", fn ->
-      create(table(:posts, prefix: :foo))
-      flush
+                 "the :prefix option `foo` does match the migrator prefix `bar`", fn ->
+      create(table(:posts, prefix: "foo"))
+      flush()
     end
   end
 
   test "forward: drops a table with prefix from migration" do
-    drop(table(:posts, prefix: :foo))
-    flush
+    drop(table(:posts, prefix: "foo"))
+    flush()
     {:drop, table} = last_command()
-    assert table.prefix == :foo
+    assert table.prefix == "foo"
   end
 
-  @tag prefix: :foo
+  @tag prefix: "foo"
   test "forward: drops a table with prefix from manager" do
     drop(table(:posts))
-    flush
+    flush()
     {:drop, table} = last_command()
-    assert table.prefix == :foo
+    assert table.prefix == "foo"
   end
 
   test "forward: rename column on table with index prefixed from migration" do
-    rename(table(:posts, prefix: :foo), :given_name, to: :first_name)
-    flush
+    rename(table(:posts, prefix: "foo"), :given_name, to: :first_name)
+    flush()
 
     {_, table, _, new_name} = last_command()
-    assert table.prefix == :foo
+    assert table.prefix == "foo"
     assert new_name == :first_name
   end
 
-  @tag prefix: :foo
+  @tag prefix: "foo"
   test "forward: rename column on table with index prefixed from manager" do
     rename(table(:posts), :given_name, to: :first_name)
-    flush
+    flush()
 
     {_, table, _, new_name} = last_command()
-    assert table.prefix == :foo
+    assert table.prefix == "foo"
     assert new_name == :first_name
   end
 
   test "forward: creates an index with prefix from migration" do
-    create index(:posts, [:title], prefix: :foo)
-    flush
+    create index(:posts, [:title], prefix: "foo")
+    flush()
     {_, index} = last_command()
-    assert index.prefix == :foo
+    assert index.prefix == "foo"
   end
 
-  @tag prefix: :foo
+  @tag prefix: "foo"
   test "forward: creates an index with prefix from manager" do
     create index(:posts, [:title])
-    flush
+    flush()
     {_, index} = last_command()
-    assert index.prefix == :foo
+    assert index.prefix == "foo"
   end
 
   test "forward: drops an index with a prefix from migration" do
-    drop index(:posts, [:title], prefix: :foo)
-    flush
+    drop index(:posts, [:title], prefix: "foo")
+    flush()
     {_, index} = last_command()
-    assert index.prefix == :foo
+    assert index.prefix == "foo"
   end
 
-  @tag prefix: :foo
+  @tag prefix: "foo"
   test "forward: drops an index with a prefix from manager" do
     drop index(:posts, [:title])
-    flush
+    flush()
     {_, index} = last_command()
-    assert index.prefix == :foo
+    assert index.prefix == "foo"
   end
 
   ## Reverse
@@ -312,7 +366,7 @@ defmodule Ecto.MigrationTest do
   test "backward: fails when executing SQL" do
     assert_raise Ecto.MigrationError, ~r/cannot reverse migration command/, fn ->
       execute "HELLO, IS IT ME YOU ARE LOOKING FOR?"
-      flush
+      flush()
     end
   end
 
@@ -321,14 +375,14 @@ defmodule Ecto.MigrationTest do
       add :title, :string
       add :cost, :decimal, precision: 3
     end
-    flush
+    flush()
 
     assert last_command() == {:drop, table}
   end
 
   test "backward: creates an empty table" do
     create table = table(:posts)
-    flush
+    flush()
 
     assert last_command() == {:drop, table}
   end
@@ -337,7 +391,7 @@ defmodule Ecto.MigrationTest do
     alter table(:posts) do
       add :summary, :text
     end
-    flush
+    flush()
 
     assert last_command() ==
            {:alter, %Table{name: :posts},
@@ -347,13 +401,13 @@ defmodule Ecto.MigrationTest do
       alter table(:posts) do
         remove :summary
       end
-      flush
+      flush()
     end
   end
 
   test "backward: rename column" do
     rename table(:posts), :given_name, to: :first_name
-    flush
+    flush()
 
     assert last_command() == {:rename, %Table{name: :posts}, :first_name, :given_name}
   end
@@ -361,25 +415,25 @@ defmodule Ecto.MigrationTest do
   test "backward: drops a table" do
     assert_raise Ecto.MigrationError, ~r/cannot reverse migration command/, fn ->
       drop table(:posts)
-      flush
+      flush()
     end
   end
 
   test "backward: creates an index" do
     create index(:posts, [:title])
-    flush
+    flush()
     assert {:drop, %Index{}} = last_command()
   end
 
   test "backward: drops an index" do
     drop index(:posts, [:title])
-    flush
+    flush()
     assert {:create, %Index{}} = last_command()
   end
 
   test "backward: renames a table" do
     rename table(:posts), to: table(:new_posts)
-    flush
+    flush()
     assert {:rename, %Table{name: :new_posts}, %Table{name: :posts}} = last_command()
   end
 

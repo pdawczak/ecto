@@ -1,3 +1,4 @@
+# TODO: Remove Ecto.Date|Time types on Ecto v2.2
 import Kernel, except: [to_string: 1]
 
 defmodule Ecto.DateTime.Utils do
@@ -12,6 +13,7 @@ defmodule Ecto.DateTime.Utils do
 
   @doc "Converts to integer if possible"
   def to_i(nil), do: nil
+  def to_i({int, _}) when is_integer(int), do: int
   def to_i(int) when is_integer(int), do: int
   def to_i(bin) when is_binary(bin) do
     case Integer.parse(bin) do
@@ -21,9 +23,9 @@ defmodule Ecto.DateTime.Utils do
   end
 
   @doc "A guard to check for dates"
-  defmacro is_date(_year, month, day) do
+  defmacro is_date(year, month, day) do
     quote do
-      unquote(month) in 1..12 and unquote(day) in 1..31
+      is_integer(unquote(year)) and unquote(month) in 1..12 and unquote(day) in 1..31
     end
   end
 
@@ -124,15 +126,15 @@ defmodule Ecto.Date do
     * an `Ecto.Date` struct itself
 
   """
-  def cast(d), do: d |> do_cast |> valid_date?
+  def cast(d), do: d |> do_cast() |> validate_cast()
 
   @doc """
-  Same as `cast/1` but raises on invalid dates.
+  Same as `cast/1` but raises `Ecto.CastError` on invalid dates.
   """
   def cast!(value) do
     case cast(value) do
       {:ok, date} -> date
-      :error -> raise ArgumentError, "cannot cast #{inspect value} to date"
+      :error -> raise Ecto.CastError, "cannot cast #{inspect value} to date"
     end
   end
 
@@ -143,6 +145,10 @@ defmodule Ecto.Date do
     do: from_parts(to_i(year), to_i(month), to_i(day))
   defp do_cast(%Ecto.Date{} = d),
     do: {:ok, d}
+  defp do_cast(%{"year" => empty, "month" => empty, "day" => empty}) when empty in ["", nil],
+    do: {:ok, nil}
+  defp do_cast(%{year: empty, month: empty, day: empty}) when empty in ["", nil],
+    do: {:ok, nil}
   defp do_cast(%{"year" => year, "month" => month, "day" => day}),
     do: from_parts(to_i(year), to_i(month), to_i(day))
   defp do_cast(%{year: year, month: month, day: day}),
@@ -152,8 +158,9 @@ defmodule Ecto.Date do
   defp do_cast(_),
     do: :error
 
-  defp valid_date?(:error), do: :error
-  defp valid_date?({:ok, %{year: y, month: m, day: d} = date}) do
+  defp validate_cast(:error), do: :error
+  defp validate_cast({:ok, nil}), do: {:ok, nil}
+  defp validate_cast({:ok, %{year: y, month: m, day: d} = date}) do
     if :calendar.valid_date(y, m, d), do: {:ok, date}, else: :error
   end
 
@@ -243,13 +250,13 @@ defmodule Ecto.Time do
 
   It supports:
 
-    * a binary in the "HH:MM:DD" format
+    * a binary in the "HH:MM:SS" format
       (may be followed by "Z", as in `12:00:00Z`)
-    * a binary in the "HH:MM:DD.USEC" format
+    * a binary in the "HH:MM:SS.USEC" format
       (may be followed by "Z", as in `12:00:00.005Z`)
-    * a map with `"hour"`, `"min"` keys with `"sec"` and `"usec"`
+    * a map with `"hour"`, `"minute"` keys with `"second"` and `"microsecond"`
       as optional keys and values are integers or binaries
-    * a map with `:hour`, `:min` keys with `:sec` and `:usec`
+    * a map with `:hour`, `:minute` keys with `:second` and `:microsecond`
       as optional keys and values are integers or binaries
     * a tuple with `{hour, min, sec}` as integers or binaries
     * a tuple with `{hour, min, sec, usec}` as integers or binaries
@@ -265,10 +272,22 @@ defmodule Ecto.Time do
   end
   def cast(%Ecto.Time{} = t),
     do: {:ok, t}
+
   def cast(%{"hour" => hour, "min" => min} = map),
     do: from_parts(to_i(hour), to_i(min), to_i(Map.get(map, "sec", 0)), to_i(Map.get(map, "usec", 0)))
   def cast(%{hour: hour, min: min} = map),
     do: from_parts(to_i(hour), to_i(min), to_i(Map.get(map, :sec, 0)), to_i(Map.get(map, :usec, 0)))
+
+  def cast(%{"hour" => empty, "minute" => empty}) when empty in ["", nil],
+    do: {:ok, nil}
+  def cast(%{hour: empty, minute: empty}) when empty in ["", nil],
+    do: {:ok, nil}
+
+  def cast(%{"hour" => hour, "minute" => minute} = map),
+    do: from_parts(to_i(hour), to_i(minute), to_i(Map.get(map, "second", 0)), to_i(Map.get(map, "microsecond", 0)))
+  def cast(%{hour: hour, minute: minute} = map),
+    do: from_parts(to_i(hour), to_i(minute), to_i(Map.get(map, :second, 0)), to_i(Map.get(map, :microsecond, 0)))
+
   def cast({hour, min, sec}),
     do: from_parts(to_i(hour), to_i(min), to_i(sec), 0)
   def cast({hour, min, sec, usec}),
@@ -277,12 +296,12 @@ defmodule Ecto.Time do
     do: :error
 
   @doc """
-  Same as `cast/1` but raises on invalid times.
+  Same as `cast/1` but raises `Ecto.CastError` on invalid times.
   """
   def cast!(value) do
     case cast(value) do
       {:ok, time} -> time
-      :error -> raise ArgumentError, "cannot cast #{inspect value} to time"
+      :error -> raise Ecto.CastError, "cannot cast #{inspect value} to time"
     end
   end
 
@@ -367,6 +386,8 @@ end
 defmodule Ecto.DateTime do
   import Ecto.DateTime.Utils
 
+  @unix_epoch :calendar.datetime_to_gregorian_seconds {{1970, 1, 1}, {0, 0, 0}}
+
   @doc """
   Compare two datetimes.
 
@@ -385,7 +406,7 @@ defmodule Ecto.DateTime do
   @doc """
   The Ecto primitive type.
   """
-  def type, do: :datetime
+  def type, do: :naive_datetime
 
   @doc """
   Casts the given value to datetime.
@@ -396,24 +417,24 @@ defmodule Ecto.DateTime do
       (may be separated by T and/or followed by "Z", as in `2014-04-17T14:00:00Z`)
     * a binary in the "YYYY-MM-DD HH:MM:SS.USEC" format
       (may be separated by T and/or followed by "Z", as in `2014-04-17T14:00:00.030Z`)
-    * a map with `"year"`, `"month"`,`"day"`, `"hour"`, `"min"` keys
-      with `"sec"` and `"usec"` as optional keys and values are integers or binaries
-    * a map with `:year`, `:month`,`:day`, `:hour`, `:min` keys
-      with `:sec` and `:usec` as optional keys and values are integers or binaries
+    * a map with `"year"`, `"month"`,`"day"`, `"hour"`, `"minute"` keys
+      with `"second"` and `"microsecond"` as optional keys and values are integers or binaries
+    * a map with `:year`, `:month`,`:day`, `:hour`, `:minute` keys
+      with `:second` and `:microsecond` as optional keys and values are integers or binaries
     * a tuple with `{{year, month, day}, {hour, min, sec}}` as integers or binaries
     * a tuple with `{{year, month, day}, {hour, min, sec, usec}}` as integers or binaries
     * an `Ecto.DateTime` struct itself
 
   """
-  def cast(dt), do: dt |> do_cast |> valid_date?
+  def cast(dt), do: dt |> do_cast() |> validate_cast()
 
   @doc """
-  Same as `cast/1` but raises on invalid datetimes.
+  Same as `cast/1` but raises `Ecto.CastError` on invalid datetimes.
   """
   def cast!(value) do
     case cast(value) do
       {:ok, datetime} -> datetime
-      :error -> raise ArgumentError, "cannot cast #{inspect value} to datetime"
+      :error -> raise Ecto.CastError, "cannot cast #{inspect value} to datetime"
     end
   end
 
@@ -443,6 +464,28 @@ defmodule Ecto.DateTime do
                to_i(Map.get(map, :usec, 0)))
   end
 
+  defp do_cast(%{"year" => empty, "month" => empty, "day" => empty,
+                 "hour" => empty, "minute" => empty}) when empty in ["", nil] do
+    {:ok, nil}
+  end
+
+  defp do_cast(%{year: empty, month: empty, day: empty,
+                 hour: empty, minute: empty}) when empty in ["", nil] do
+    {:ok, nil}
+  end
+
+  defp do_cast(%{"year" => year, "month" => month, "day" => day, "hour" => hour, "minute" => min} = map) do
+    from_parts(to_i(year), to_i(month), to_i(day),
+               to_i(hour), to_i(min), to_i(Map.get(map, "second", 0)),
+               to_i(Map.get(map, "microsecond", 0)))
+  end
+
+  defp do_cast(%{year: year, month: month, day: day, hour: hour, minute: min} = map) do
+    from_parts(to_i(year), to_i(month), to_i(day),
+               to_i(hour), to_i(min), to_i(Map.get(map, :second, 0)),
+               to_i(Map.get(map, :microsecond, 0)))
+  end
+
   defp do_cast({{year, month, day}, {hour, min, sec}}) do
     from_parts(to_i(year), to_i(month), to_i(day),
                to_i(hour), to_i(min), to_i(sec), 0)
@@ -457,8 +500,9 @@ defmodule Ecto.DateTime do
     :error
   end
 
-  defp valid_date?(:error), do: :error
-  defp valid_date?({:ok, %{year: y, month: m, day: d} = datetime}) do
+  defp validate_cast(:error), do: :error
+  defp validate_cast({:ok, nil}), do: {:ok, nil}
+  defp validate_cast({:ok, %{year: y, month: m, day: d} = datetime}) do
     if :calendar.valid_date(y, m, d), do: {:ok, datetime}, else: :error
   end
 
@@ -555,7 +599,7 @@ defmodule Ecto.DateTime do
   `precision` can be `:sec` or `:usec`.
   """
   def utc(precision \\ :sec) do
-    erl_load(autogenerate(precision))
+    autogenerate(precision)
   end
 
   @doc """
@@ -573,19 +617,28 @@ defmodule Ecto.DateTime do
                    hour: hour, min: min, sec: sec}
   end
 
-  # Callback invoked by autogenerate in schema.
+  def from_unix!(integer, unit) do
+    total = System.convert_time_unit(integer, unit, :microseconds)
+    microsecond = rem(total, 1_000_000)
+    {{year, month, day}, {hour, minute, second}} =
+      :calendar.gregorian_seconds_to_datetime(@unix_epoch + div(total, 1_000_000))
+    %Ecto.DateTime{year: year, month: month, day: day,
+                      hour: hour, min: minute, sec: second, usec: microsecond}
+  end
+
+  # Callback invoked by autogenerate fields.
   @doc false
   def autogenerate(precision \\ :sec)
 
   def autogenerate(:sec) do
     {date, {h, m, s}} = :erlang.universaltime
-    {date, {h, m, s, 0}}
+    erl_load({date, {h, m, s, 0}})
   end
 
   def autogenerate(:usec) do
     timestamp = {_, _, usec} = :os.timestamp
-    {date, {h, m, s}} =:calendar.now_to_datetime(timestamp)
-    {date, {h, m, s, usec}}
+    {date, {h, m, s}} = :calendar.now_to_datetime(timestamp)
+    erl_load({date, {h, m, s, usec}})
   end
 
   defp erl_load({{year, month, day}, {hour, min, sec, usec}}) do
@@ -605,5 +658,30 @@ defimpl Inspect, for: [Ecto.DateTime, Ecto.Date, Ecto.Time] do
 
   def inspect(dt, _opts) do
     "#" <> @inspected <> "<" <> @for.to_string(dt) <> ">"
+  end
+end
+
+defimpl Ecto.DataType, for: Ecto.DateTime do
+  def dump(%Ecto.DateTime{year: year, month: month, day: day,
+                          hour: hour, min: min, sec: sec, usec: usec}) do
+    {:ok, {{year, month, day}, {hour, min, sec, usec}}}
+  end
+end
+
+defimpl Ecto.DataType, for: Ecto.Date do
+  def dump(%Ecto.Date{year: year, month: month, day: day}) do
+    {:ok, {year, month, day}}
+  end
+end
+
+defimpl Ecto.DataType, for: Ecto.Time do
+  def dump(%Ecto.Time{hour: hour, min: min, sec: sec, usec: usec}) do
+    {:ok, {hour, min, sec, usec}}
+  end
+end
+
+if Code.ensure_loaded?(Poison) do
+  defimpl Poison.Encoder, for: [Ecto.Date, Ecto.Time, Ecto.DateTime] do
+    def encode(dt, _opts), do: <<?", @for.to_iso8601(dt)::binary, ?">>
   end
 end

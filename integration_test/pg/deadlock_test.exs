@@ -39,7 +39,7 @@ defmodule Ecto.Integration.DeadlockTest do
         Logger.debug "#{inspect self()} got killed by deadlock detection"
         assert %Postgrex.Error{postgres: %{code: :deadlock_detected}} = err
 
-        assert_tx_aborted
+        assert_tx_aborted()
 
         # Trapping a transaction should still be fine.
         try do
@@ -63,7 +63,7 @@ defmodule Ecto.Integration.DeadlockTest do
 
   defp assert_tx_aborted do
     try do
-      Ecto.Adapters.SQL.query!(PoolRepo, "SELECT 1", []);
+      PoolRepo.query!("SELECT 1");
     rescue
       err in [Postgrex.Error] ->
         # current transaction is aborted, commands ignored until end of transaction block
@@ -75,6 +75,6 @@ defmodule Ecto.Integration.DeadlockTest do
 
   defp pg_advisory_xact_lock(key) do
     %{rows: [[:void]]} =
-      Ecto.Adapters.SQL.query!(PoolRepo, "SELECT pg_advisory_xact_lock($1);", [key])
+      PoolRepo.query!("SELECT pg_advisory_xact_lock($1);", [key])
   end
 end

@@ -5,7 +5,9 @@ defmodule Ecto.TestAdapter do
 
   defmacro __before_compile__(_opts), do: :ok
 
-  def application, do: :ecto
+  def ensure_all_started(_, _) do
+    {:ok, []}
+  end
 
   def child_spec(_repo, opts) do
     :ecto   = opts[:otp_app]
@@ -47,43 +49,50 @@ defmodule Ecto.TestAdapter do
     {1, nil}
   end
 
-  def execute(_repo, _meta, {:nocache, {op, %{from: {source, _}}}}, _params, _preprocess, _opts) do
-    send self, {op, source}
+  def execute(_repo, meta, {:nocache, {op, %{from: {source, _}}}}, _params, _preprocess, _opts) do
+    send self(), {op, {meta.prefix,source}}
     {1, nil}
+  end
+
+  def stream(repo, meta, prepared, params, preprocess, opts) do
+    Stream.map([:execute], fn(:execute) ->
+      send self(), :stream_execute
+      execute(repo, meta, prepared, params, preprocess, opts)
+    end)
   end
 
   ## Schema
 
-  def insert_all(_repo, %{source: {_, source}}, _header, rows, _returning, _opts) do
+  def insert_all(_repo, %{source: source}, _header, rows, _on_conflict, _returning, _opts) do
     send self(), {:insert_all, source, rows}
     {1, nil}
   end
 
-  def insert(_repo, %{source: {nil, "schema_migrations"}}, val, _, _) do
+  def insert(_repo, %{source: {nil, "schema_migrations"}}, val, _, _, _) do
     version = Keyword.fetch!(val, :version)
     Process.put(:migrated_versions, [version|migrated_versions()])
     {:ok, [version: 1]}
   end
 
-  def insert(_repo, %{context: nil}, _fields, return, _opts),
-    do: send(self, :insert) && {:ok, Enum.zip(return, 1..length(return))}
-  def insert(_repo, %{context: {:invalid, _}=res}, _fields, _return, _opts),
+  def insert(_repo, %{context: nil, source: source}, _fields, _on_conflict, return, _opts),
+    do: send(self(), {:insert, source}) && {:ok, Enum.zip(return, 1..length(return))}
+  def insert(_repo, %{context: {:invalid, _} = res}, _fields, _on_conflict, _return, _opts),
     do: res
 
   # Notice the list of changes is never empty.
-  def update(_repo, %{context: nil}, [_|_], _filters, return, _opts),
-    do: send(self, :update) && {:ok, Enum.zip(return, 1..length(return))}
-  def update(_repo, %{context: {:invalid, _}=res}, [_|_], _filters, _return, _opts),
+  def update(_repo, %{context: nil, source: source}, [_|_], _filters, return, _opts),
+    do: send(self(), {:update, source}) && {:ok, Enum.zip(return, 1..length(return))}
+  def update(_repo, %{context: {:invalid, _} = res}, [_|_], _filters, _return, _opts),
     do: res
 
-  def delete(_repo, _model_meta, _filter, _opts),
-    do: send(self, :delete) && {:ok, []}
+  def delete(_repo, meta, _filter, _opts),
+    do: send(self(), {:delete, meta.source}) && {:ok, []}
 
   ## Transactions
 
   def transaction(_repo, _opts, fun) do
     # Makes transactions "trackable" in tests
-    send self, {:transaction, fun}
+    send self(), {:transaction, fun}
     try do
       {:ok, fun.()}
     catch
@@ -93,7 +102,7 @@ defmodule Ecto.TestAdapter do
   end
 
   def rollback(_repo, value) do
-    send self, {:rollback, value}
+    send self(), {:rollback, value}
     throw {:ecto_rollback, value}
   end
 
@@ -117,6 +126,12 @@ Application.put_env(:ecto, Ecto.TestRepo, [user: "invalid"])
 
 defmodule Ecto.TestRepo do
   use Ecto.Repo, otp_app: :ecto, adapter: Ecto.TestAdapter
+
+  def init(type, opts) do
+    opts = [url: "ecto://user:pass@local/hello"] ++ opts
+    opts[:parent] && send(opts[:parent], {__MODULE__, type, opts})
+    {:ok, opts}
+  end
 end
 
-Ecto.TestRepo.start_link(url: "ecto://user:pass@local/hello")
+Ecto.TestRepo.start_link()

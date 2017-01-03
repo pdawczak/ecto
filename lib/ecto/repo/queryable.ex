@@ -10,12 +10,6 @@ defmodule Ecto.Repo.Queryable do
 
   require Ecto.Query
 
-  def transaction(adapter, repo, opts, fun_or_multi) when is_list(opts) do
-    IO.write :stderr, "warning: Ecto.Repo.transaction/2 with opts as first " <>
-                      "argument is deprecated, please switch arguments\n#{Exception.format_stacktrace()}"
-    transaction(adapter, repo, fun_or_multi, opts)
-  end
-
   def transaction(adapter, repo, fun, opts) when is_function(fun, 0) do
     adapter.transaction(repo, opts, fun)
   end
@@ -37,7 +31,17 @@ defmodule Ecto.Repo.Queryable do
       queryable
       |> Ecto.Queryable.to_query
       |> Ecto.Query.Planner.returning(true)
+      |> attach_prefix(opts)
     execute(:all, repo, adapter, query, opts) |> elem(1)
+  end
+
+  def stream(repo, adapter, queryable, opts) when is_list(opts) do
+    query =
+      queryable
+      |> Ecto.Queryable.to_query
+      |> Ecto.Query.Planner.returning(true)
+      |> attach_prefix(opts)
+    stream(:all, repo, adapter, query, opts)
   end
 
   def get(repo, adapter, queryable, id, opts) do
@@ -81,7 +85,7 @@ defmodule Ecto.Repo.Queryable do
   end
 
   def update_all(repo, adapter, queryable, updates, opts) when is_list(opts) do
-    query = Query.from q in queryable, update: ^updates
+    query = Query.from queryable, update: ^updates
     update_all(repo, adapter, query, opts)
   end
 
@@ -89,8 +93,9 @@ defmodule Ecto.Repo.Queryable do
     query =
       queryable
       |> Ecto.Queryable.to_query
-      |> assert_no_select!(:update_all)
+      |> Ecto.Query.Planner.assert_no_select!(:update_all)
       |> Ecto.Query.Planner.returning(opts[:returning] || false)
+      |> attach_prefix(opts)
     execute(:update_all, repo, adapter, query, opts)
   end
 
@@ -98,38 +103,59 @@ defmodule Ecto.Repo.Queryable do
     query =
       queryable
       |> Ecto.Queryable.to_query
-      |> assert_no_select!(:delete_all)
+      |> Ecto.Query.Planner.assert_no_select!(:delete_all)
       |> Ecto.Query.Planner.returning(opts[:returning] || false)
+      |> attach_prefix(opts)
     execute(:delete_all, repo, adapter, query, opts)
   end
 
   ## Helpers
 
-  defp assert_no_select!(%{select: nil} = query, _operation) do
-    query
-  end
-  defp assert_no_select!(%{select: _} = query, operation) do
-    raise Ecto.QueryError,
-      query: query,
-      message: "`select` clause is not supported in `#{operation}`, " <>
-               "please pass the :returning option instead"
+  defp attach_prefix(query, opts) do
+    case Keyword.fetch(opts, :prefix) do
+      {:ok, prefix} -> %{query | prefix: prefix}
+      :error -> query
+    end
   end
 
   defp execute(operation, repo, adapter, query, opts) when is_list(opts) do
-    {meta, prepared, params} = Planner.query(query, operation, repo, adapter)
+    {meta, prepared, params} = Planner.query(query, operation, repo, adapter, 0)
 
     case meta do
       %{fields: nil} ->
         adapter.execute(repo, meta, prepared, params, nil, opts)
       %{select: select, fields: fields, prefix: prefix, take: take,
         sources: sources, assocs: assocs, preloads: preloads} ->
-        preprocess = preprocess(prefix, sources, adapter)
+        preprocess    = preprocess(prefix, sources, adapter)
         {count, rows} = adapter.execute(repo, meta, prepared, params, preprocess, opts)
+        postprocess   = postprocess(select, fields, take)
+        {_, take_0}   = Map.get(take, 0, {:any, %{}})
         {count,
           rows
           |> Ecto.Repo.Assoc.query(assocs, sources)
-          |> Ecto.Repo.Preloader.query(repo, preloads, assocs, postprocess(select, fields),
-                                       [take: Map.get(take, 0)] ++ opts)}
+          |> Ecto.Repo.Preloader.query(repo, preloads, take_0, postprocess, opts)}
+    end
+  end
+
+  defp stream(operation, repo, adapter, query, opts) do
+    {meta, prepared, params} = Planner.query(query, operation, repo, adapter, 0)
+
+    case meta do
+      %{fields: nil} ->
+        adapter.stream(repo, meta, prepared, params, nil, opts)
+        |> Stream.flat_map(fn({_, nil}) -> [] end)
+      %{select: select, fields: fields, prefix: prefix, take: take,
+        sources: sources, assocs: assocs, preloads: preloads} ->
+        preprocess    = preprocess(prefix, sources, adapter)
+        stream        = adapter.stream(repo, meta, prepared, params, preprocess, opts)
+        postprocess   = postprocess(select, fields, take)
+        {_, take_0}   = Map.get(take, 0, {:any, %{}})
+
+        Stream.flat_map(stream, fn({_, rows}) ->
+          rows
+          |> Ecto.Repo.Assoc.query(assocs, sources)
+          |> Ecto.Repo.Preloader.query(repo, preloads, take_0, postprocess, opts)
+        end)
     end
   end
 
@@ -143,11 +169,15 @@ defmodule Ecto.Repo.Queryable do
         value
       {_source, nil} when is_list(value) ->
         load_schemaless(fields, value, %{})
-      {source, schema} ->
+      {source, schema} when is_list(value) ->
         Ecto.Schema.__load__(schema, prefix, source, context, {fields, value},
                              &Ecto.Type.adapter_load(adapter, &1, &2))
-      %Ecto.SubQuery{sources: sources, fields: fields, select: select} ->
-        postprocess(select, fields).(load_subquery(fields, value, prefix, context, sources, adapter))
+      {source, schema} when is_map(value) ->
+        Ecto.Schema.__load__(schema, prefix, source, context, value,
+                             &Ecto.Type.adapter_load(adapter, &1, &2))
+      %Ecto.SubQuery{meta: %{sources: sources, fields: fields, select: select, take: take}} ->
+        loaded = load_subquery(fields, value, prefix, context, sources, adapter)
+        postprocess(select, fields, take).(loaded)
     end
   end
 
@@ -195,53 +225,87 @@ defmodule Ecto.Repo.Queryable do
     end
   end
 
-  defp postprocess(select, fields) do
+  defp postprocess(select, fields, take) do
     # The planner always put the from as the first
     # entry in the query, avoiding fetching it multiple
     # times even if it appears multiple times in the query.
     # So we always need to handle it specially.
     from? = match?([{:&, _, [0, _, _]}|_], fields)
-    &postprocess(&1, select, from?)
+    &postprocess(&1, select, take, from?)
   end
 
-  defp postprocess(row, expr, true),
-    do: transform_row(expr, hd(row), tl(row)) |> elem(0)
-  defp postprocess(row, expr, false),
-    do: transform_row(expr, nil, row) |> elem(0)
+  defp postprocess(row, expr, take, true),
+    do: transform_row(expr, take, hd(row), tl(row)) |> elem(0)
+  defp postprocess(row, expr, take, false),
+    do: transform_row(expr, take, nil, row) |> elem(0)
 
-  defp transform_row({:&, _, [0]}, from, values) do
-    {from, values}
+  defp transform_row({:&, _, [0]}, take, from, values) do
+    {convert_to_tag(from, take[0]), values}
   end
 
-  defp transform_row({:{}, _, list}, from, values) do
-    {result, values} = transform_row(list, from, values)
+  defp transform_row({:&, _, [ix]}, take, _from, [value|values]) do
+    {convert_to_tag(value, take[ix]), values}
+  end
+
+  defp transform_row({:{}, _, list}, take, from, values) do
+    {result, values} = transform_row(list, take, from, values)
     {List.to_tuple(result), values}
   end
 
-  defp transform_row({left, right}, from, values) do
-    {[left, right], values} = transform_row([left, right], from, values)
+  defp transform_row({left, right}, take, from, values) do
+    {[left, right], values} = transform_row([left, right], take, from, values)
     {{left, right}, values}
   end
 
-  defp transform_row({:%{}, _, pairs}, from, values) do
+  defp transform_row({:%{}, _, [{:|, _, [data, pairs]}]}, take, from, values) do
+    {data, values} = transform_row(data, take, from, values)
+    Enum.reduce pairs, {data, values}, fn {k, v}, {data, acc} ->
+      {k, acc} = transform_row(k, take, from, acc)
+      {v, acc} = transform_row(v, take, from, acc)
+      {:maps.update(k, v, data), acc}
+    end
+  end
+
+  defp transform_row({:%{}, _, pairs}, take, from, values) do
     Enum.reduce pairs, {%{}, values}, fn {k, v}, {map, acc} ->
-      {k, acc} = transform_row(k, from, acc)
-      {v, acc} = transform_row(v, from, acc)
+      {k, acc} = transform_row(k, take, from, acc)
+      {v, acc} = transform_row(v, take, from, acc)
       {Map.put(map, k, v), acc}
     end
   end
 
-  defp transform_row(list, from, values) when is_list(list) do
-    Enum.map_reduce(list, values, &transform_row(&1, from, &2))
+  defp transform_row(list, take, from, values) when is_list(list) do
+    Enum.map_reduce(list, values, &transform_row(&1, take, from, &2))
   end
 
-  defp transform_row(expr, _from, values) when is_atom(expr) or is_binary(expr) or is_number(expr) do
+  defp transform_row(expr, _take, _from, values)
+       when is_atom(expr) or is_binary(expr) or is_number(expr) do
     {expr, values}
   end
 
-  defp transform_row(_, _from, values) do
-    [value|values] = values
+  defp transform_row(_, _take, _from, [value|values]) do
     {value, values}
+  end
+
+  # We only need to worry about the struct -> map scenario.
+  # map -> struct is denied during compilation time.
+  # map -> map, struct -> struct and map/struct -> any are noop.
+  defp convert_to_tag(%{__struct__: _} = value, {:map, fields}),
+    do: to_map(value, fields)
+  defp convert_to_tag(value, _),
+    do: value
+
+  defp to_map(value, fields) when is_list(value) do
+    Enum.map(value, &to_map(&1, fields))
+  end
+
+  defp to_map(value, fields) do
+    for field <- fields, into: %{} do
+      case field do
+        {k, v} -> {k, to_map(Map.fetch!(value, k), List.wrap(v))}
+        k -> {k, Map.fetch!(value, k)}
+      end
+    end
   end
 
   defp query_for_get(repo, _queryable, nil) do

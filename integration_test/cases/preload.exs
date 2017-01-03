@@ -1,5 +1,5 @@
 defmodule Ecto.Integration.PreloadTest do
-  use Ecto.Integration.Case, async: true
+  use Ecto.Integration.Case, async: Application.get_env(:ecto, :async_integration_tests, true)
 
   alias Ecto.Integration.TestRepo
   import Ecto.Query
@@ -274,6 +274,24 @@ defmodule Ecto.Integration.PreloadTest do
 
   ## With queries
 
+  test "preload with function" do
+    p1 = TestRepo.insert!(%Post{title: "1"})
+    p2 = TestRepo.insert!(%Post{title: "2"})
+    p3 = TestRepo.insert!(%Post{title: "3"})
+
+    # We use the same text to expose bugs in preload sorting
+    %Comment{id: cid1} = TestRepo.insert!(%Comment{text: "1", post_id: p1.id})
+    %Comment{id: cid3} = TestRepo.insert!(%Comment{text: "2", post_id: p2.id})
+    %Comment{id: cid2} = TestRepo.insert!(%Comment{text: "2", post_id: p1.id})
+    %Comment{id: cid4} = TestRepo.insert!(%Comment{text: "3", post_id: p2.id})
+
+    assert [pe3, pe1, pe2] = TestRepo.preload([p3, p1, p2],
+                                              comments: fn _ -> TestRepo.all(Comment) end)
+    assert [%Comment{id: ^cid1}, %Comment{id: ^cid2}] = pe1.comments
+    assert [%Comment{id: ^cid3}, %Comment{id: ^cid4}] = pe2.comments
+    assert [] = pe3.comments
+  end
+
   test "preload with query" do
     p1 = TestRepo.insert!(%Post{title: "1"})
     p2 = TestRepo.insert!(%Post{title: "2"})
@@ -326,20 +344,26 @@ defmodule Ecto.Integration.PreloadTest do
 
     u1 = TestRepo.insert!(%User{name: "foo"})
     u2 = TestRepo.insert!(%User{name: "bar"})
+    u3 = TestRepo.insert!(%User{name: "baz"})
+    u4 = TestRepo.insert!(%User{name: "norf"})
 
     %Comment{} = TestRepo.insert!(%Comment{post_id: pid1, author_id: u1.id})
     %Comment{} = TestRepo.insert!(%Comment{post_id: pid1, author_id: u1.id})
     %Comment{} = TestRepo.insert!(%Comment{post_id: pid1, author_id: u2.id})
+    %Comment{} = TestRepo.insert!(%Comment{post_id: pid1, author_id: u3.id})
+    %Comment{} = TestRepo.insert!(%Comment{post_id: pid1, author_id: u4.id})
 
     np1 = TestRepo.preload(p1, comments_authors: from(u in User, where: u.name == "foo"))
     assert np1.comments_authors == [u1]
 
-    assert_raise ArgumentError, ~r/custom query did not return a map/, fn ->
+    assert_raise ArgumentError, ~r/Ecto expected a map\/struct with the key `id` but got: \d+/, fn ->
       TestRepo.preload(p1, comments_authors: from(u in User, order_by: u.name, select: u.id))
     end
 
+    # The subpreload order does not matter because the result is dictated by comments
     np1 = TestRepo.preload(p1, comments_authors: from(u in User, order_by: u.name, select: %{id: u.id}))
-    assert np1.comments_authors == [%{id: u1.id}, %{id: u2.id}]
+    assert np1.comments_authors ==
+           [%{id: u1.id}, %{id: u2.id}, %{id: u3.id}, %{id: u4.id}]
   end
 
   ## With take

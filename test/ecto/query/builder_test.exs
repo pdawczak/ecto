@@ -40,6 +40,9 @@ defmodule Ecto.Query.BuilderTest do
                                            {:raw, ", "}, {:expr, ^0}, {:raw, ")"}) end), %{0 => {0, :any}}} ==
       escape(quote do fragment("date_add(?, ?)", p.created_at, ^0) end, [p: 0], __ENV__)
 
+    assert {Macro.escape(quote do fragment({:raw, ""}, {:expr, ^0}, {:raw, "::text"}) end), %{0 => {0, :any}}} ==
+      escape(quote do fragment(~S"?::text", ^0) end, [p: 0], __ENV__)
+
     assert {Macro.escape(quote do fragment({:raw, "query?("}, {:expr, &0.created_at},
                                            {:raw, ")"}) end), %{}} ==
       escape(quote do fragment("query\\?(?)", p.created_at) end, [p: 0], __ENV__)
@@ -79,6 +82,10 @@ defmodule Ecto.Query.BuilderTest do
       escape(quote(do: :atom), [], __ENV__)
     end
 
+    assert_raise Ecto.Query.CompileError, ~r"short-circuit operators are not supported: `&&`", fn ->
+      escape(quote(do: true && false), [], __ENV__)
+    end
+
     assert_raise Ecto.Query.CompileError, ~r"`unknown\(1, 2\)` is not a valid query expression", fn ->
       escape(quote(do: unknown(1, 2)), [], __ENV__)
     end
@@ -103,9 +110,6 @@ defmodule Ecto.Query.BuilderTest do
 
     assert {Macro.escape(quote(do: ^0)), %{0 => {quote(do: [] ++ []), :any}}} ==
            escape(quote(do: ^([] ++ [])), [], __ENV__)
-
-    assert {Macro.escape(quote(do: ^0 > ^1)), %{0 => {1, :any}, 1 => {2, :any}}} ==
-           escape(quote(do: ^1 > ^2), [], __ENV__)
   end
 
   defp params(quoted, type, vars \\ []) do
@@ -113,23 +117,23 @@ defmodule Ecto.Query.BuilderTest do
   end
 
   test "infers the type for parameter" do
-    assert params(quote(do: ^1 == 2), :any) ==
-           %{0 => {1, :integer}}
+    assert %{0 => {_, :integer}} =
+           params(quote(do: ^1 == 2), :any)
 
-    assert params(quote(do: 2 == ^1), :any) ==
-           %{0 => {1, :integer}}
+    assert %{0 => {_, :integer}} =
+           params(quote(do: 2 == ^1), :any)
 
-    assert params(quote(do: ^1 == ^2), :any) ==
-           %{0 => {1, :any}, 1 => {2, :any}}
+    assert %{0 => {_, :any}, 1 => {_, :any}} =
+           params(quote(do: ^1 == ^2), :any)
 
-    assert params(quote(do: ^1 == p.title), :any, [p: 0]) ==
-           %{0 => {1, {0, :title}}}
+    assert %{0 => {_, {0, :title}}} =
+           params(quote(do: ^1 == p.title), :any, [p: 0])
 
-    assert params(quote(do: ^1 and true), :any) ==
-           %{0 => {1, :boolean}}
+    assert %{0 => {_, :boolean}} =
+           params(quote(do: ^1 and true), :any)
 
-    assert params(quote(do: ^1), :boolean) ==
-           %{0 => {1, :boolean}}
+    assert %{0 => {_, :boolean}} =
+           params(quote(do: ^1), :boolean)
   end
 
   test "returns the type for quoted query expression" do
@@ -152,7 +156,10 @@ defmodule Ecto.Query.BuilderTest do
     assert quoted_type({:and, [], [1, 2]}, []) == :boolean
     assert quoted_type({:or, [], [1, 2]}, []) == :boolean
     assert quoted_type({:not, [], [1]}, []) == :boolean
-    assert quoted_type({:avg, [], [1]}, []) == :integer
+
+    assert quoted_type({:count, [], [1]}, []) == :integer
+    assert quoted_type({:max, [], [1]}, []) == :integer
+    assert quoted_type({:avg, [], [1]}, []) == :any
 
     assert quoted_type({{:., [], [{:p, [], Elixir}, :title]}, [], []}, [p: 0]) == {0, :title}
     assert quoted_type({:field, [], [{:p, [], Elixir}, :title]}, [p: 0]) == {0, :title}

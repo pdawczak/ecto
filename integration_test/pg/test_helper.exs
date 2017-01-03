@@ -17,8 +17,8 @@ Code.require_file "../support/migration.exs", __DIR__
 
 pool =
   case System.get_env("ECTO_POOL") || "poolboy" do
-    "poolboy"        -> DBConnection.Poolboy
-    "sojourn_broker" -> DBConnection.Sojourn
+    "poolboy" -> DBConnection.Poolboy
+    "sbroker" -> DBConnection.Sojourn
   end
 
 # Pool repo for async, safe tests
@@ -65,14 +65,23 @@ defmodule Ecto.Integration.Case do
   end
 end
 
-{:ok, _} = Application.ensure_all_started(:postgrex)
+{:ok, _} = Ecto.Adapters.Postgres.ensure_all_started(TestRepo, :temporary)
 
 # Load up the repository, start it, and run migrations
-_   = Ecto.Storage.down(TestRepo)
-:ok = Ecto.Storage.up(TestRepo)
+_   = Ecto.Adapters.Postgres.storage_down(TestRepo.config)
+:ok = Ecto.Adapters.Postgres.storage_up(TestRepo.config)
 
 {:ok, _pid} = TestRepo.start_link
 {:ok, _pid} = PoolRepo.start_link
+
+%{rows: [[version]]} = TestRepo.query!("SHOW server_version", [])
+
+if Version.match?(version, "~> 9.5") do
+  ExUnit.configure(exclude: [:without_conflict_target])
+else
+  Application.put_env(:ecto, :postgres_map_type, "json")
+  ExUnit.configure(exclude: [:upsert, :upsert_all, :array_type])
+end
 
 :ok = Ecto.Migrator.up(TestRepo, 0, Ecto.Integration.Migration, log: false)
 Ecto.Adapters.SQL.Sandbox.mode(TestRepo, :manual)

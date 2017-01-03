@@ -1,11 +1,12 @@
 Code.require_file "../support/types.exs", __DIR__
 
 defmodule Ecto.Integration.AssocTest do
-  use Ecto.Integration.Case, async: true
+  use Ecto.Integration.Case, async: Application.get_env(:ecto, :async_integration_tests, true)
 
   alias Ecto.Integration.TestRepo
   import Ecto.Query
 
+  alias Ecto.Integration.Custom
   alias Ecto.Integration.Post
   alias Ecto.Integration.User
   alias Ecto.Integration.PostUser
@@ -70,9 +71,13 @@ defmodule Ecto.Integration.AssocTest do
 
     query = Ecto.assoc([p1, p2], :comments_authors) |> order_by([a], a.name)
     assert [^u2, ^u1] = TestRepo.all(query)
+
+    # Dynamic through
+    Ecto.assoc([p1, p2], [:comments, :author]) |> order_by([a], a.name)
+    assert [^u2, ^u1] = TestRepo.all(query)
   end
 
-  test "has_many through-through assoc" do
+  test "has_many through-through assoc leading" do
     p1 = TestRepo.insert!(%Post{})
     p2 = TestRepo.insert!(%Post{})
 
@@ -89,6 +94,25 @@ defmodule Ecto.Integration.AssocTest do
 
     query = Ecto.assoc([p1, p2], :comments_authors_permalinks) |> order_by([p], p.url)
     assert [^pl2, ^pl1] = TestRepo.all(query)
+
+    # Dynamic through
+    query = Ecto.assoc([p1, p2], [:comments, :author, :permalink]) |> order_by([p], p.url)
+    assert [^pl2, ^pl1] = TestRepo.all(query)
+  end
+
+  test "has_many through-through assoc trailing" do
+    p1  = TestRepo.insert!(%Post{})
+    u1  = TestRepo.insert!(%User{})
+    pl1 = TestRepo.insert!(%Permalink{user_id: u1.id, post_id: p1.id})
+
+    %Comment{} = TestRepo.insert!(%Comment{post_id: p1.id, author_id: u1.id})
+
+    query = Ecto.assoc([pl1], :post_comments_authors)
+    assert [^u1] = TestRepo.all(query)
+
+    # Dynamic through
+    query = Ecto.assoc([pl1], [:post, :comments, :author])
+    assert [^u1] = TestRepo.all(query)
   end
 
   test "many_to_many assoc" do
@@ -376,6 +400,24 @@ defmodule Ecto.Integration.AssocTest do
     assert up1.updated_at
   end
 
+  test "many_to_many changeset assoc with self-referential binary_id" do
+    assoc_custom = TestRepo.insert!(%Custom{})
+    custom = TestRepo.insert!(%Custom{customs: [assoc_custom]})
+
+    custom = Custom |> TestRepo.get!(custom.bid) |> TestRepo.preload(:customs)
+    assert [_] = custom.customs
+
+    custom =
+      custom
+      |> Ecto.Changeset.change(%{})
+      |> Ecto.Changeset.put_assoc(:customs, [])
+      |> TestRepo.update!
+    assert [] = custom.customs
+
+    custom = Custom |> TestRepo.get!(custom.bid) |> TestRepo.preload(:customs)
+    assert [] = custom.customs
+  end
+
   @tag :unique_constraint
   test "has_many changeset assoc with constraints" do
     author = TestRepo.insert!(%User{name: "john doe"})
@@ -395,7 +437,7 @@ defmodule Ecto.Integration.AssocTest do
     # This will only work if we delete before performing inserts
     changeset =
       author
-      |> Ecto.Changeset.cast(%{"posts" => posts_params}, ~w(), ~w())
+      |> Ecto.Changeset.cast(%{"posts" => posts_params}, ~w())
       |> Ecto.Changeset.cast_assoc(:posts)
     author = TestRepo.update! changeset
     assert Enum.map(author.posts, &(&1.title)) == ["fresh", "fresh"]
@@ -447,7 +489,7 @@ defmodule Ecto.Integration.AssocTest do
     assert perma.post_id == nil
   end
 
-  test "inserting with associations in structs" do
+  test "inserting struct with associations" do
     tree = %Permalink{
       url: "root",
       post: %Post{
@@ -470,6 +512,30 @@ defmodule Ecto.Integration.AssocTest do
     assert tree.post.id
     assert length(tree.post.comments) == 2
     assert Enum.all?(tree.post.comments, & &1.id)
+  end
+
+  test "inserting struct with empty associations" do
+    permalink = TestRepo.insert!(%Permalink{url: "root", post: nil})
+    assert permalink.post == nil
+
+    post = TestRepo.insert!(%Post{title: "empty", comments: []})
+    assert post.comments == []
+  end
+
+  test "inserting changeset with empty associations" do
+    changeset =
+      %Permalink{}
+      |> Ecto.Changeset.cast(%{url: "root", post: nil}, [:url])
+      |> Ecto.Changeset.cast_assoc(:post)
+    permalink = TestRepo.insert!(changeset)
+    assert permalink.post == nil
+
+    changeset =
+      %Post{}
+      |> Ecto.Changeset.cast(%{title: "root", comments: []}, [:title])
+      |> Ecto.Changeset.cast_assoc(:comments)
+    post = TestRepo.insert!(changeset)
+    assert post.comments == []
   end
 
   ## Dependent

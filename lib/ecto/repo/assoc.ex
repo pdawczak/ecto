@@ -1,11 +1,11 @@
 defmodule Ecto.Repo.Assoc do
-  # The module invoked by repomodules
+  # The module invoked by repo modules
   # for association related functionality.
   @moduledoc false
 
   @doc """
   Transforms a result set based on query assocs, loading
-  the associations onto their parent model.
+  the associations onto their parent schema.
   """
   @spec query([Ecto.Schema.t], list, tuple) :: [Ecto.Schema.t]
   def query(rows, assocs, sources)
@@ -37,9 +37,14 @@ defmodule Ecto.Repo.Assoc do
   defp merge([struct|sub_structs], {keys, dict, sub_dicts}, parent_key) do
     child_key =
       if struct do
-        [{_, key}] = Ecto.primary_key!(struct)
-        key || raise Ecto.NoPrimaryKeyValueError, struct: struct
+        struct
+        |> Ecto.primary_key!()
+        |> Enum.map(&elem(&1, 1))
       end
+
+    if child_key && nil in child_key do
+      raise Ecto.NoPrimaryKeyValueError, struct: struct
+    end
 
     # Traverse sub_structs adding one by one to the tree.
     # Note we need to traverse even if we don't have a child_key
@@ -89,8 +94,8 @@ defmodule Ecto.Repo.Assoc do
 
   defp create_refls(idx, fields, sources) do
     Enum.map(fields, fn {field, {child_idx, child_fields}} ->
-      {_source, model} = elem(sources, idx)
-      {model.__schema__(:association, field),
+      {_source, schema} = elem(sources, idx)
+      {schema.__schema__(:association, field),
        create_refls(child_idx, child_fields, sources)}
     end)
   end

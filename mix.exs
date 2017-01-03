@@ -1,17 +1,20 @@
 defmodule Ecto.Mixfile do
   use Mix.Project
 
-  @version "2.0.0-beta.2"
+  @version "2.2.0-dev"
   @adapters [:pg, :mysql]
 
   def project do
     [app: :ecto,
      version: @version,
-     elixir: "~> 1.2",
-     deps: deps,
+     elixir: "~> 1.3",
+     deps: deps(),
      build_per_environment: false,
      consolidate_protocols: false,
      test_paths: test_paths(Mix.env),
+     xref: [exclude: [Mariaex, Ecto.Adapters.MySQL.Connection,
+                      Postgrex, Ecto.Adapters.Postgres.Connection,
+                      DBConnection, DBConnection.Ownership]],
 
      # Custom testing
      aliases: ["test.all": ["test", "test.adapters"],
@@ -19,36 +22,37 @@ defmodule Ecto.Mixfile do
      preferred_cli_env: ["test.all": :test],
 
      # Hex
-     description: description,
-     package: package,
+     description: description(),
+     package: package(),
 
      # Docs
      name: "Ecto",
      docs: [source_ref: "v#{@version}", main: "Ecto",
             canonical: "http://hexdocs.pm/ecto",
-            source_url: "https://github.com/elixir-lang/ecto"]]
+            source_url: "https://github.com/elixir-ecto/ecto",
+            extras: ["guides/Getting Started.md"]]]
   end
 
   def application do
     [applications: [:logger, :decimal, :poolboy],
-     env: [json_library: Poison], mod: {Ecto.Application, []}]
+     env: [json_library: Poison, postgres_map_type: "jsonb"], mod: {Ecto.Application, []}]
   end
 
   defp deps do
     [{:poolboy, "~> 1.5"},
-     {:decimal, "~> 1.0"},
+     {:decimal, "~> 1.2"},
 
      # Drivers
-     {:mariaex, "~> 0.7.0", optional: true},
-     {:postgrex, "~> 0.11.1", optional: true},
+     {:db_connection, "~> 1.1", optional: true},
+     {:postgrex, "~> 0.13.0", optional: true},
+     {:mariaex, "~> 0.8.0", optional: true},
 
      # Optional
-     {:sbroker, "~> 0.7", optional: true},
-     {:poison, "~> 1.5 or ~> 2.0", optional: true},
+     {:sbroker, "~> 1.0", optional: true},
+     {:poison, "~> 2.2 or ~> 3.0", optional: true},
 
      # Docs
-     {:ex_doc, "~> 0.10", only: :docs},
-     {:earmark, "~> 0.1", only: :docs},
+     {:ex_doc, "~> 0.14", only: :docs},
      {:inch_ex, ">= 0.0.0", only: :docs}]
   end
 
@@ -57,14 +61,14 @@ defmodule Ecto.Mixfile do
 
   defp description do
     """
-    Ecto is a domain specific language for writing queries and interacting with databases in Elixir.
+    A database wrapper and language integrated query for Elixir.
     """
   end
 
   defp package do
     [maintainers: ["Eric Meadows-Jönsson", "José Valim", "James Fish", "Michał Muskała"],
      licenses: ["Apache 2.0"],
-     links: %{"GitHub" => "https://github.com/elixir-lang/ecto"},
+     links: %{"GitHub" => "https://github.com/elixir-ecto/ecto"},
      files: ~w(mix.exs README.md CHANGELOG.md lib) ++
             ~w(integration_test/cases integration_test/sql integration_test/support)]
   end

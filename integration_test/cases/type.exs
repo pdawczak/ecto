@@ -1,24 +1,18 @@
 Code.require_file "../support/types.exs", __DIR__
 
 defmodule Ecto.Integration.TypeTest do
-  use Ecto.Integration.Case, async: true
+  use Ecto.Integration.Case, async: Application.get_env(:ecto, :async_integration_tests, true)
 
+  alias Ecto.Integration.{Custom, Item, Order, Post, User, Tag}
   alias Ecto.Integration.TestRepo
   import Ecto.Query
-
-  alias Ecto.Integration.Post
-  alias Ecto.Integration.Tag
-  alias Ecto.Integration.Custom
-  alias Ecto.Integration.Order
-  alias Ecto.Integration.Item
 
   test "primitive types" do
     integer  = 1
     float    = 0.1
     text     = <<0,1>>
     uuid     = "00010203-0405-0607-0809-0a0b0c0d0e0f"
-    datetime = %Ecto.DateTime{year: 2014, month: 1, day: 16,
-                              hour: 20, min: 26, sec: 51, usec: 0}
+    datetime = ~N[2014-01-16 20:26:51.000000]
 
     TestRepo.insert!(%Post{text: text, public: true, visits: integer, uuid: uuid,
                            counter: integer, inserted_at: datetime, intensity: float})
@@ -49,13 +43,17 @@ defmodule Ecto.Integration.TypeTest do
     # UUID
     assert [^uuid] = TestRepo.all(from p in Post, where: p.uuid == ^uuid, select: p.uuid)
 
-    # Datetime
+    # NaiveDatetime
     assert [^datetime] = TestRepo.all(from p in Post, where: p.inserted_at == ^datetime, select: p.inserted_at)
+
+    # Datetime
+    datetime = System.system_time(:seconds) * 1_000_000 |> DateTime.from_unix!(:microseconds)
+    TestRepo.insert!(%User{inserted_at: datetime})
+    assert [^datetime] = TestRepo.all(from u in User, where: u.inserted_at == ^datetime, select: u.inserted_at)
   end
 
   test "aggregated types" do
-    datetime = %Ecto.DateTime{year: 2014, month: 1, day: 16,
-                              hour: 20, min: 26, sec: 51, usec: 0}
+    datetime = ~N[2014-01-16 20:26:51.000000]
     TestRepo.insert!(%Post{inserted_at: datetime})
     query = from p in Post, select: max(p.inserted_at)
     assert [^datetime] = TestRepo.all(query)
@@ -70,17 +68,12 @@ defmodule Ecto.Integration.TypeTest do
     assert [1]   = TestRepo.all(from p in Post, select: type(^"1", p.visits))
     assert [1.0] = TestRepo.all(from p in Post, select: type(^"1", p.intensity))
 
-    # Datetime
-    datetime = {{2014, 04, 17}, {14, 00, 00, 00}}
-    ecto_datetime = %Ecto.DateTime{year: 2014, month: 4, day: 17, hour: 14, min: 0, sec: 0, usec: 0}
-    assert [^ecto_datetime] = TestRepo.all(from Post, select: type(^datetime, Ecto.DateTime))
-
     # Custom wrappers
     assert [1] = TestRepo.all(from Post, select: type(^"1", Elixir.Custom.Permalink))
 
     # Custom types
-    datetime = %Ecto.DateTime{year: 2014, month: 1, day: 16, hour: 20, min: 26, sec: 51, usec: 0}
-    assert [^datetime] = TestRepo.all(from Post, select: type(^datetime, Ecto.DateTime))
+    uuid = Ecto.UUID.generate()
+    assert [^uuid] = TestRepo.all(from Post, select: type(^uuid, Ecto.UUID))
   end
 
   test "binary id type" do
@@ -90,30 +83,6 @@ defmodule Ecto.Integration.TypeTest do
     assert [^bid] = TestRepo.all(from c in Custom, select: type(^bid, :binary_id))
   end
 
-  test "composite types in select" do
-    assert %Post{} = TestRepo.insert!(%Post{title: "1", text: "hai"})
-
-    assert [{"1", "hai"}] ==
-           TestRepo.all(from p in Post, select: {p.title, p.text})
-
-    assert [["1", "hai"]] ==
-           TestRepo.all(from p in Post, select: [p.title, p.text])
-
-    assert [%{:title => "1", 3 => "hai", "text" => "hai"}] ==
-           TestRepo.all(from p in Post, select: %{
-             :title => p.title,
-             "text" => p.text,
-             3 => p.text
-           })
-
-    assert [%{:title => "1", "1" => "hai", "text" => "hai"}] ==
-           TestRepo.all(from p in Post, select: %{
-             :title  => p.title,
-             p.title => p.text,
-             "text"  => p.text
-           })
-  end
-
   @tag :array_type
   test "array type" do
     ints = [1, 2, 3]
@@ -121,6 +90,10 @@ defmodule Ecto.Integration.TypeTest do
 
     assert TestRepo.all(from t in Tag, where: t.ints == ^[], select: t.ints) == []
     assert TestRepo.all(from t in Tag, where: t.ints == ^[1, 2, 3], select: t.ints) == [ints]
+
+    # Both sides interpolation
+    assert TestRepo.all(from t in Tag, where: ^"b" in ^["a", "b", "c"], select: t.ints) == [ints]
+    assert TestRepo.all(from t in Tag, where: ^"b" in [^"a", ^"b", ^"c"], select: t.ints) == [ints]
 
     # Querying
     assert TestRepo.all(from t in Tag, where: t.ints == [1, 2, 3], select: t.ints) == [ints]
@@ -156,7 +129,7 @@ defmodule Ecto.Integration.TypeTest do
   end
 
   @tag :map_type
-  test "map type" do
+  test "untyped map" do
     post1 = TestRepo.insert!(%Post{meta: %{"foo" => "bar", "baz" => "bat"}})
     post2 = TestRepo.insert!(%Post{meta: %{foo: "bar", baz: "bat"}})
 
@@ -164,6 +137,17 @@ defmodule Ecto.Integration.TypeTest do
            [%{"foo" => "bar", "baz" => "bat"}]
     assert TestRepo.all(from p in Post, where: p.id == ^post2.id, select: p.meta) ==
            [%{"foo" => "bar", "baz" => "bat"}]
+  end
+
+  @tag :map_type
+  test "typed map" do
+    post1 = TestRepo.insert!(%Post{links: %{"foo" => "http://foo.com", "bar" => "http://bar.com"}})
+    post2 = TestRepo.insert!(%Post{links: %{foo: "http://foo.com", bar: "http://bar.com"}})
+
+    assert TestRepo.all(from p in Post, where: p.id == ^post1.id, select: p.links) ==
+           [%{"foo" => "http://foo.com", "bar" => "http://bar.com"}]
+    assert TestRepo.all(from p in Post, where: p.id == ^post2.id, select: p.links) ==
+           [%{"foo" => "http://foo.com", "bar" => "http://bar.com"}]
   end
 
   @tag :map_type
@@ -181,7 +165,7 @@ defmodule Ecto.Integration.TypeTest do
 
   @tag :map_type
   test "embeds one" do
-    item = %Item{price: 123, valid_at: Ecto.Date.utc}
+    item = %Item{price: 123, valid_at: ~D[2014-01-16]}
     order =
       %Order{}
       |> Ecto.Changeset.change
@@ -204,7 +188,7 @@ defmodule Ecto.Integration.TypeTest do
   @tag :map_type
   @tag :array_type
   test "embeds many" do
-    item = %Item{price: 123, valid_at: Ecto.Date.utc}
+    item = %Item{price: 123, valid_at: ~D[2014-01-16]}
     tag =
       %Tag{}
       |> Ecto.Changeset.change
@@ -236,5 +220,31 @@ defmodule Ecto.Integration.TypeTest do
     assert [^decimal] = TestRepo.all(from p in Post, where: p.cost == ^1, select: p.cost)
     assert [^decimal] = TestRepo.all(from p in Post, where: p.cost == 1.0, select: p.cost)
     assert [^decimal] = TestRepo.all(from p in Post, where: p.cost == 1, select: p.cost)
+  end
+
+  test "schemaless types" do
+    datetime = ~N[2014-01-16 20:26:51]
+    assert {1, _} =
+           TestRepo.insert_all("posts", [[inserted_at: datetime]])
+    assert {1, _} =
+           TestRepo.update_all("posts", set: [inserted_at: datetime])
+    assert [_] =
+           TestRepo.all(from p in "posts", where: p.inserted_at >= ^datetime, select: p.inserted_at)
+    assert [_] =
+           TestRepo.all(from p in "posts", where: p.inserted_at in [^datetime], select: p.inserted_at)
+    assert [_] =
+           TestRepo.all(from p in "posts", where: p.inserted_at in ^[datetime], select: p.inserted_at)
+
+    datetime = System.system_time(:seconds) * 1_000_000 |> DateTime.from_unix!(:microseconds)
+    assert {1, _} =
+           TestRepo.insert_all("users", [[inserted_at: datetime, updated_at: datetime]])
+    assert {1, _} =
+           TestRepo.update_all("users", set: [inserted_at: datetime])
+    assert [_] =
+           TestRepo.all(from u in "users", where: u.inserted_at >= ^datetime, select: u.updated_at)
+    assert [_] =
+           TestRepo.all(from u in "users", where: u.inserted_at in [^datetime], select: u.updated_at)
+    assert [_] =
+           TestRepo.all(from u in "users", where: u.inserted_at in ^[datetime], select: u.updated_at)
   end
 end

@@ -17,18 +17,26 @@ defmodule Ecto.Migration.Runner do
   """
   def run(repo, module, direction, operation, migrator_direction, opts) do
     level = Keyword.get(opts, :log, :info)
-    args  = [self, repo, direction, migrator_direction, level]
+    args  = [self(), repo, direction, migrator_direction, level]
 
     {:ok, runner} = Supervisor.start_child(Ecto.Migration.Supervisor, args)
-    Process.put(:ecto_migration, %{runner: runner, prefix: opts[:prefix]})
+    metadata(runner, opts)
 
     log(level, "== Running #{inspect module}.#{operation}/0 #{direction}")
     {time1, _} = :timer.tc(module, operation, [])
     {time2, _} = :timer.tc(&flush/0, [])
     time = time1 + time2
-    log(level, "== Migrated in #{inspect(div(time, 10000) / 10)}s")
+    log(level, "== Migrated in #{inspect(div(time, 100_000) / 10)}s")
 
     stop()
+  end
+
+  @doc """
+  Stores the runner metadata.
+  """
+  def metadata(runner, opts) do
+    prefix = opts[:prefix]
+    Process.put(:ecto_migration, %{runner: runner, prefix: prefix && to_string(prefix)})
   end
 
   @doc """
@@ -68,7 +76,7 @@ defmodule Ecto.Migration.Runner do
   def prefix do
     case Process.get(:ecto_migration) do
       %{prefix: prefix} -> prefix
-      _ -> raise "could not find migration runner process for #{inspect self}"
+      _ -> raise "could not find migration runner process for #{inspect self()}"
     end
   end
 
@@ -148,11 +156,11 @@ defmodule Ecto.Migration.Runner do
     log_and_execute_ddl(repo, level, command)
   end
 
-  defp execute_in_direction(repo, :backward, level, {command, %Index{}=index}) when command in @creates do
+  defp execute_in_direction(repo, :backward, level, {command, %Index{} = index}) when command in @creates do
     log_and_execute_ddl(repo, level, {:drop, index})
   end
 
-  defp execute_in_direction(repo, :backward, level, {:drop, %Index{}=index}) do
+  defp execute_in_direction(repo, :backward, level, {:drop, %Index{} = index}) do
     log_and_execute_ddl(repo, level, {:create, index})
   end
 
@@ -166,18 +174,18 @@ defmodule Ecto.Migration.Runner do
     end
   end
 
-  defp reverse({command, %Table{}=table, _columns}) when command in @creates,
+  defp reverse({command, %Table{} = table, _columns}) when command in @creates,
     do: {:drop, table}
-  defp reverse({:alter,  %Table{}=table, changes}) do
+  defp reverse({:alter,  %Table{} = table, changes}) do
     if reversed = table_reverse(changes) do
       {:alter, table, reversed}
     end
   end
-  defp reverse({:rename, %Table{}=table_current, %Table{}=table_new}),
+  defp reverse({:rename, %Table{} = table_current, %Table{} = table_new}),
     do: {:rename, table_new, table_current}
-  defp reverse({:rename, %Table{}=table, current_column, new_column}),
+  defp reverse({:rename, %Table{} = table, current_column, new_column}),
     do: {:rename, table, new_column, current_column}
-  defp reverse({command, %Constraint{}=constraint}) when command in @creates,
+  defp reverse({command, %Constraint{} = constraint}) when command in @creates,
     do: {:drop, constraint}
   defp reverse(_command), do: false
 
@@ -196,7 +204,7 @@ defmodule Ecto.Migration.Runner do
   defp runner do
     case Process.get(:ecto_migration) do
       %{runner: runner} -> runner
-      _ -> raise "could not find migration runner process for #{inspect self}"
+      _ -> raise "could not find migration runner process for #{inspect self()}"
     end
   end
 

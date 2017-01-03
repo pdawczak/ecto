@@ -53,7 +53,7 @@ defmodule Ecto.Migrator do
       Can be any of `Logger.level/0` values or `false`.
     * `:prefix` - the prefix to run the migrations on
   """
-  @spec up(Ecto.Repo.t, integer, Module.t, Keyword.t) :: :ok | :already_up | no_return
+  @spec up(Ecto.Repo.t, integer, module, Keyword.t) :: :ok | :already_up | no_return
   def up(repo, version, module, opts \\ []) do
     versions = migrated_versions(repo, opts)
 
@@ -69,7 +69,7 @@ defmodule Ecto.Migrator do
     run_maybe_in_transaction repo, module, fn ->
       attempt(repo, module, :forward, :up, :up, opts)
         || attempt(repo, module, :forward, :change, :up, opts)
-        || raise Ecto.MigrationError, message: "#{inspect module} does not implement a `up/0` or `change/0` function"
+        || raise Ecto.MigrationError, "#{inspect module} does not implement a `up/0` or `change/0` function"
       SchemaMigration.up(repo, version, opts[:prefix])
     end
   end
@@ -83,7 +83,7 @@ defmodule Ecto.Migrator do
       Can be any of `Logger.level/0` values or `false`.
 
   """
-  @spec down(Ecto.Repo.t, integer, Module.t) :: :ok | :already_down | no_return
+  @spec down(Ecto.Repo.t, integer, module) :: :ok | :already_down | no_return
   def down(repo, version, module, opts \\ []) do
     versions = migrated_versions(repo, opts)
 
@@ -99,7 +99,7 @@ defmodule Ecto.Migrator do
     run_maybe_in_transaction repo, module, fn ->
       attempt(repo, module, :forward, :down, :down, opts)
         || attempt(repo, module, :backward, :change, :down, opts)
-        || raise Ecto.MigrationError, message: "#{inspect module} does not implement a `down/0` or `change/0` function"
+        || raise Ecto.MigrationError, "#{inspect module} does not implement a `down/0` or `change/0` function"
       SchemaMigration.down(repo, version, opts[:prefix])
     end
   end
@@ -149,8 +149,25 @@ defmodule Ecto.Migrator do
       step = opts[:step] ->
         run_step(repo, versions, directory, direction, step, opts)
       true ->
-        raise ArgumentError, message: "expected one of :all, :to, or :step strategies"
+        raise ArgumentError, "expected one of :all, :to, or :step strategies"
     end
+  end
+
+  @doc """
+  Returns an array of tuples as the migration status of the given repo,
+  without actually running any migrations.
+
+  """
+  def migrations(repo, directory) do
+    versions = migrated_versions(repo)
+
+    Enum.map(pending_in_direction(versions, directory, :down) |> Enum.reverse, fn {a, b, _}
+     -> {:up, a, b}
+    end)
+    ++
+    Enum.map(pending_in_direction(versions, directory, :up), fn {a, b, _} ->
+      {:down, a, b}
+    end)
   end
 
   defp run_to(repo, versions, directory, direction, target, opts) do
@@ -235,12 +252,12 @@ defmodule Ecto.Migrator do
   defp ensure_no_duplication([{version, name, _} | t]) do
     if List.keyfind(t, version, 0) do
       raise Ecto.MigrationError,
-        message: "migrations can't be executed, migration version #{version} is duplicated"
+            "migrations can't be executed, migration version #{version} is duplicated"
     end
 
     if List.keyfind(t, name, 1) do
       raise Ecto.MigrationError,
-        message: "migrations can't be executed, migration name #{name} is duplicated"
+            "migrations can't be executed, migration name #{name} is duplicated"
     end
 
     ensure_no_duplication(t)
@@ -250,7 +267,7 @@ defmodule Ecto.Migrator do
 
   defp raise_no_migration_in_file(file) do
     raise Ecto.MigrationError,
-      message: "file #{Path.relative_to_cwd(file)} does not contain any Ecto.Migration"
+          "file #{Path.relative_to_cwd(file)} does not contain any Ecto.Migration"
   end
 
   defp log(false, _msg), do: :ok

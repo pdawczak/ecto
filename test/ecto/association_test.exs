@@ -7,11 +7,14 @@ defmodule Ecto.AssociationTest do
 
   alias __MODULE__.Author
   alias __MODULE__.Comment
+  alias __MODULE__.CommentWithPrefix
   alias __MODULE__.Permalink
   alias __MODULE__.Post
+  alias __MODULE__.PostWithPrefix
   alias __MODULE__.Summary
   alias __MODULE__.Email
   alias __MODULE__.Profile
+  alias __MODULE__.AuthorPermalink
 
   defmodule Post do
     use Ecto.Schema
@@ -45,7 +48,27 @@ defmodule Ecto.AssociationTest do
 
     schema "permalinks" do
       field :url, :string
-      many_to_many :authors, Author, join_through: "authors_permalinks", defaults: [title: "m2m!"]
+      many_to_many :authors, Author, join_through: AuthorPermalink, defaults: [title: "m2m!"]
+      has_many :author_emails, through: [:authors, :emails]
+    end
+  end
+
+  defmodule PostWithPrefix do
+    use Ecto.Schema
+    @schema_prefix "my_prefix"
+
+    schema "posts" do
+      belongs_to :author, Author
+      has_many :comments_with_prefix, CommentWithPrefix
+    end
+  end
+
+  defmodule CommentWithPrefix do
+    use Ecto.Schema
+    @schema_prefix "my_prefix"
+
+    schema "comments" do
+      belongs_to :posts_with_prefix, Post, foreign_key: :post_with_prefix_id
     end
   end
 
@@ -62,6 +85,17 @@ defmodule Ecto.AssociationTest do
         defaults: [name: "default"], on_replace: :delete
       many_to_many :permalinks, {"custom_permalinks", Permalink},
         join_through: "authors_permalinks"
+      has_many :posts_with_prefix, PostWithPrefix
+      has_many :comments_with_prefix, through: [:posts_with_prefix, :comments_with_prefix]
+    end
+  end
+
+  defmodule AuthorPermalink do
+    use Ecto.Schema
+
+    schema "authors_permalinks" do
+      field :author_id
+      field :permalink_id
     end
   end
 
@@ -136,6 +170,9 @@ defmodule Ecto.AssociationTest do
     assert inspect(Ecto.Association.Has.assoc_query(assoc, nil, [])) ==
            inspect(from c in Permalink, where: c.post_id in ^[])
 
+    assert inspect(Ecto.Association.Has.assoc_query(assoc, nil, [1])) ==
+           inspect(from c in Permalink, where: c.post_id == ^1)
+
     assert inspect(Ecto.Association.Has.assoc_query(assoc, nil, [1, 2, 3])) ==
            inspect(from c in Permalink, where: c.post_id in ^[1, 2, 3])
   end
@@ -163,33 +200,39 @@ defmodule Ecto.AssociationTest do
   test "belongs to" do
     assoc = Post.__schema__(:association, :author)
 
-    assert inspect(Ecto.Association.Has.joins_query(assoc)) ==
+    assert inspect(Ecto.Association.BelongsTo.joins_query(assoc)) ==
            inspect(from p in Post, join: a in Author, on: a.id == p.author_id)
 
-    assert inspect(Ecto.Association.Has.assoc_query(assoc, nil, [])) ==
+    assert inspect(Ecto.Association.BelongsTo.assoc_query(assoc, nil, [])) ==
            inspect(from a in Author, where: a.id in ^[])
 
-    assert inspect(Ecto.Association.Has.assoc_query(assoc, nil, [1, 2, 3])) ==
+    assert inspect(Ecto.Association.BelongsTo.assoc_query(assoc, nil, [1])) ==
+           inspect(from a in Author, where: a.id == ^1)
+
+    assert inspect(Ecto.Association.BelongsTo.assoc_query(assoc, nil, [1, 2, 3])) ==
            inspect(from a in Author, where: a.id in ^[1, 2, 3])
   end
 
   test "belongs to with specified source" do
     assoc = Email.__schema__(:association, :author)
 
-    assert inspect(Ecto.Association.Has.joins_query(assoc)) ==
+    assert inspect(Ecto.Association.BelongsTo.joins_query(assoc)) ==
            inspect(from e in Email, join: a in {"post_authors", Author}, on: a.id == e.author_id)
 
-    assert inspect(Ecto.Association.Has.assoc_query(assoc, nil, [])) ==
+    assert inspect(Ecto.Association.BelongsTo.assoc_query(assoc, nil, [])) ==
            inspect(from a in {"post_authors", Author}, where: a.id in ^[])
 
-    assert inspect(Ecto.Association.Has.assoc_query(assoc, nil, [1, 2, 3])) ==
+    assert inspect(Ecto.Association.BelongsTo.assoc_query(assoc, nil, [1])) ==
+           inspect(from a in {"post_authors", Author}, where: a.id == ^1)
+
+    assert inspect(Ecto.Association.BelongsTo.assoc_query(assoc, nil, [1, 2, 3])) ==
            inspect(from a in {"post_authors", Author}, where: a.id in ^[1, 2, 3])
   end
 
   test "belongs to custom assoc query" do
     assoc = Post.__schema__(:association, :author)
     query = from a in Author, limit: 5
-    assert inspect(Ecto.Association.Has.assoc_query(assoc, query, [1, 2, 3])) ==
+    assert inspect(Ecto.Association.BelongsTo.assoc_query(assoc, query, [1, 2, 3])) ==
            inspect(from a in Author, where: a.id in ^[1, 2, 3], limit: 5)
   end
 
@@ -198,18 +241,20 @@ defmodule Ecto.AssociationTest do
 
     assert inspect(Ecto.Association.ManyToMany.joins_query(assoc)) ==
            inspect(from p in Permalink,
-                    join: m in "authors_permalinks", on: m.permalink_id == p.id,
+                    join: m in AuthorPermalink, on: m.permalink_id == p.id,
                     join: a in Author, on: m.author_id == a.id)
 
     assert inspect(Ecto.Association.ManyToMany.assoc_query(assoc, nil, [])) ==
            inspect(from a in Author,
-                    join: m in "authors_permalinks", on: m.author_id == a.id,
-                    where: m.permalink_id in ^[])
+                    join: p in Permalink, on: p.id in ^[],
+                    join: m in AuthorPermalink, on: m.permalink_id == p.id,
+                    where: m.author_id == a.id)
 
     assert inspect(Ecto.Association.ManyToMany.assoc_query(assoc, nil, [1, 2, 3])) ==
            inspect(from a in Author,
-                    join: m in "authors_permalinks", on: m.author_id == a.id,
-                    where: m.permalink_id in ^[1, 2, 3])
+                    join: p in Permalink, on: p.id in ^[1, 2, 3],
+                    join: m in AuthorPermalink, on: m.permalink_id == p.id,
+                    where: m.author_id == a.id)
   end
 
   test "many to many with specified source" do
@@ -222,13 +267,15 @@ defmodule Ecto.AssociationTest do
 
     assert inspect(Ecto.Association.ManyToMany.assoc_query(assoc, nil, [])) ==
            inspect(from p in {"custom_permalinks", Permalink},
-                    join: m in "authors_permalinks", on: m.permalink_id == p.id,
-                    where: m.author_id in ^[])
+                    join: a in Author, on: a.id in ^[],
+                    join: m in "authors_permalinks", on: m.author_id == a.id,
+                    where: m.permalink_id == p.id)
 
     assert inspect(Ecto.Association.ManyToMany.assoc_query(assoc, nil, [1, 2, 3])) ==
            inspect(from p in {"custom_permalinks", Permalink},
-                    join: m in "authors_permalinks", on: m.permalink_id == p.id,
-                    where: m.author_id in ^[1, 2, 3])
+                    join: a in Author, on: a.id in ^[1, 2, 3],
+                    join: m in "authors_permalinks", on: m.author_id == a.id,
+                    where: m.permalink_id == p.id)
   end
 
   test "many to many custom assoc query" do
@@ -236,8 +283,9 @@ defmodule Ecto.AssociationTest do
     query = from a in Author, limit: 5
     assert inspect(Ecto.Association.ManyToMany.assoc_query(assoc, query, [1, 2, 3])) ==
            inspect(from a in Author,
-                    join: m in "authors_permalinks", on: m.author_id == a.id,
-                    where: m.permalink_id in ^[1, 2, 3], limit: 5)
+                    join: p in Permalink, on: p.id in ^[1, 2, 3],
+                    join: m in AuthorPermalink, on: m.permalink_id == p.id,
+                    where: m.author_id == a.id, limit: 5)
   end
 
   test "has many through many to many" do
@@ -330,6 +378,16 @@ defmodule Ecto.AssociationTest do
                         distinct: true, limit: 5)
   end
 
+  test "has many through many to many and has many" do
+    assoc = Permalink.__schema__(:association, :author_emails)
+    assert inspect(Ecto.Association.HasThrough.assoc_query(assoc, nil, [1, 2, 3])) ==
+           inspect(from e in {"users_emails", Email},
+                        join: p in Permalink, on: p.id in ^[1, 2, 3],
+                        join: ap in AuthorPermalink, on: ap.permalink_id == p.id,
+                        join: a in Author, on: ap.author_id == a.id,
+                        where: e.author_id == a.id, distinct: true)
+  end
+
   ## Integration tests through Ecto
 
   test "build/2" do
@@ -384,6 +442,13 @@ defmodule Ecto.AssociationTest do
     assert build_assoc(%Post{id: 1}, :author, title: "Hello!") ==
            %Author{title: "Hello!"}
 
+    # 2 belongs to
+    with author_post = build_assoc(%Author{id: 1}, :posts),
+         author_and_summary_post = build_assoc(%Summary{id: 2}, :posts, author_post) do
+      assert author_and_summary_post.author_id == 1
+      assert author_and_summary_post.summary_id == 2
+    end
+
     # many to many
     assert build_assoc(%Permalink{id: 1}, :authors, title: "Hello!") ==
            %Author{title: "Hello!"}
@@ -404,10 +469,16 @@ defmodule Ecto.AssociationTest do
 
   test "assoc/2" do
     assert inspect(assoc(%Post{id: 1}, :comments)) ==
-           inspect(from c in Comment, where: c.post_id in ^[1])
+           inspect(from c in Comment, where: c.post_id == ^1)
 
     assert inspect(assoc([%Post{id: 1}, %Post{id: 2}], :comments)) ==
            inspect(from c in Comment, where: c.post_id in ^[1, 2])
+  end
+
+  test "assoc/2 with prefixes" do
+    author = %Author{id: 1}
+    assert Ecto.assoc(author, :posts_with_prefix).prefix == "my_prefix"
+    assert Ecto.assoc(author, :comments_with_prefix).prefix == "my_prefix"
   end
 
   test "assoc/2 filters nil ids" do
@@ -438,11 +509,11 @@ defmodule Ecto.AssociationTest do
   alias Ecto.Repo.Preloader
 
   test "preload: normalizer" do
-    assert Preloader.normalize(:foo, [], nil, []) ==
+    assert Preloader.normalize(:foo, nil, []) ==
            [foo: {nil, nil, []}]
-    assert Preloader.normalize([foo: :bar], [], nil, []) ==
+    assert Preloader.normalize([foo: :bar], nil, []) ==
            [foo: {nil, nil, [bar: {nil, nil, []}]}]
-    assert Preloader.normalize([foo: [:bar, baz: :bat], this: :that], [], nil, []) ==
+    assert Preloader.normalize([foo: [:bar, baz: :bat], this: :that], nil, []) ==
            [this: {nil, nil, [that: {nil, nil, []}]},
             foo: {nil, nil, [baz: {nil, nil, [bat: {nil, nil, []}]},
                              bar: {nil, nil, []}]}]
@@ -450,43 +521,37 @@ defmodule Ecto.AssociationTest do
 
   test "preload: normalize with query" do
     query = from(p in Post, limit: 1)
-    assert Preloader.normalize([foo: query], [], nil, []) ==
+    assert Preloader.normalize([foo: query], nil, []) ==
            [foo: {nil, query, []}]
-    assert Preloader.normalize([foo: {query, :bar}], [], nil, []) ==
+    assert Preloader.normalize([foo: {query, :bar}], nil, []) ==
            [foo: {nil, query, [bar: {nil, nil, []}]}]
-    assert Preloader.normalize([foo: {query, bar: :baz}], [], nil, []) ==
+    assert Preloader.normalize([foo: {query, bar: :baz}], nil, []) ==
            [foo: {nil, query, [bar: {nil, nil, [baz: {nil, nil, []}]}]}]
   end
 
   test "preload: normalize with take" do
-    assert Preloader.normalize([:foo], [], [foo: :id], []) ==
+    assert Preloader.normalize([:foo], [foo: :id], []) ==
            [foo: {[:id], nil, []}]
-    assert Preloader.normalize([foo: :bar], [], [foo: :id], []) ==
+    assert Preloader.normalize([foo: :bar], [foo: :id], []) ==
            [foo: {[:id], nil, [bar: {nil, nil, []}]}]
-    assert Preloader.normalize([foo: :bar], [], [foo: [:id, bar: :id]], []) ==
+    assert Preloader.normalize([foo: :bar], [foo: [:id, bar: :id]], []) ==
            [foo: {[:id, bar: :id], nil, [bar: {[:id], nil, []}]}]
-    assert Preloader.normalize([foo: [bar: :baz]], [], [foo: [:id, bar: :id]], []) ==
+    assert Preloader.normalize([foo: [bar: :baz]], [foo: [:id, bar: :id]], []) ==
            [foo: {[:id, bar: :id], nil, [bar: {[:id], nil, [baz: {nil, nil, []}]}]}]
-  end
-
-  test "preload: raises on assoc conflict" do
-    assert_raise ArgumentError, ~r"cannot preload association `:foo`", fn ->
-      Preloader.normalize(:foo, [foo: []], nil, [])
-    end
   end
 
   test "preload: raises on invalid preload" do
     assert_raise ArgumentError, ~r"invalid preload `123` in `123`", fn ->
-      Preloader.normalize(123, [], nil, 123)
+      Preloader.normalize(123, nil, 123)
     end
 
     assert_raise ArgumentError, ~r"invalid preload `{:bar, :baz}` in", fn ->
-      Preloader.normalize([foo: {:bar, :baz}], [], nil, []) == [foo: [bar: []]]
+      Preloader.normalize([foo: {:bar, :baz}], nil, []) == [foo: [bar: []]]
     end
   end
 
-  defp expand(model, preloads, take \\ nil) do
-    Preloader.expand(model, Preloader.normalize(preloads, [], take, preloads), {%{}, %{}})
+  defp expand(schema, preloads, take \\ nil) do
+    Preloader.expand(schema, Preloader.normalize(preloads, take, preloads), {%{}, %{}})
   end
 
   test "preload: expand" do
